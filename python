@@ -15,7 +15,7 @@ class OneRoster:
         self._client_id = os.getenv('CLIENT_ID')
         self._client_secret = os.getenv('CLIENT_SECRET')
         # Base URL for all API requests
-        self.base_url = "https://api.classlink.com/oneroster"
+        self.base_url = "https://api.classlink.com/ims/oneroster/v1p1"
         # List of data collections to be fetched
         self.collections = ["academicSessions", "orgs", "courses", "classes", "users", "enrollments", "demographics"]
 
