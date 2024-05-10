@@ -27,7 +27,7 @@ func NewOneRoster() *OneRoster {
     return &OneRoster{
         clientID:     os.Getenv("CLIENT_ID"),
         clientSecret: os.Getenv("CLIENT_SECRET"),
-        baseURL:      "https://api.classlink.com/oneroster",
+        baseURL:      os.Getenv("BASE_URL"),
         collections:  []string{"academicSessions", "orgs", "courses", "classes", "users", "enrollments", "demographics"},
         httpClient:   &http.Client{},
     }
