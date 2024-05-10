@@ -9,7 +9,7 @@ class OneRoster {
         this.clientId = process.env.CLIENT_ID;
         this.clientSecret = process.env.CLIENT_SECRET;
         // Define the base URL and the endpoints to access
-        this.baseUrl = "https://api.classlink.com/oneroster";
+        this.baseUrl = process.env.BASE_URL;
         this.collections = ["academicSessions", "orgs", "courses", "classes", "users", "enrollments", "demographics"];
     }
 
