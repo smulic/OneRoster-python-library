@@ -16,7 +16,7 @@ class OneRoster {
         $this->clientId = getenv('CLIENT_ID');
         $this->clientSecret = getenv('CLIENT_SECRET');
         // Define the base URL and the endpoints to access
-        $this->baseUrl = "https://api.classlink.com/oneroster";
+        $this->baseUrl = getenv('BASE_URL');
         $this->collections = ["academicSessions", "orgs", "courses", "classes", "users", "enrollments", "demographics"];
     }
 
