@@ -1,0 +1,104 @@
+import os
+import time
+import random
+from random import randint
+from urllib.parse import quote, quote_plus, unquote
+import hmac
+import base64
+import hashlib
+import requests
+from collections import OrderedDict
+
+class OneRoster:
+    def __init__(self):
+        self._client_id = os.getenv('CLIENT_ID')
+        self._client_secret = os.getenv('CLIENT_SECRET')
+        self.base_url = "https://api.classlink.com/oneroster"
+        self.collections = ["academicSessions", "orgs", "courses", "classes", "users", "enrollments", "demographics"]
+
+    def fetch_all_data(self):
+        for collection in self.collections:
+            url = f"{self.base_url}/{collection}"
+            self._fetch_collection(url)
+
+    def _fetch_collection(self, url: str):
+        limit = 10000
+        offset = 0
+        total_count = None
+        running_total = 0
+        retries = 0
+
+        while total_count is None or running_total < total_count:
+            data = self.make_roster_request(url, limit, offset)
+            if 'status_code' in data and data['status_code'] != 200:
+                if data['status_code'] in [429, 502]:
+                    retries = self._handle_rate_limits(retries, data['status_code'])
+                continue
+            page_data = data['response']
+            count = len(page_data)
+            running_total += count
+            if 'x-total-count' in data:
+                total_count = int(data['x-total-count'])
+            offset += limit
+
+    def make_roster_request(self, url: str, limit: int, offset: int) -> dict:
+        url += f"?limit={limit}&offset={offset}"
+        return self._make_get_request(url)
+
+    def _handle_rate_limits(self, retries: int, error_code: int):
+        wait_time = (2 ** retries) + random.uniform(0, 1)  # Exponential backoff with jitter
+        time.sleep(wait_time)
+        retries += 1
+        if retries > 5:  # Limit the number of retries to prevent infinite loops
+            raise Exception(f"API request failed after several retries due to error {error_code}")
+        return retries
+
+    def _make_get_request(self, url: str) -> dict:
+        try:
+            response = requests.get(url=url, headers={'Authorization': self._build_auth_header()})
+            response.raise_for_status()
+            return {
+                'status_code': response.status_code,
+                'response': response.json(),
+                'x-total-count': response.headers.get('x-total-count')
+            }
+        except requests.exceptions.HTTPError as e:
+            return {'status_code': e.response.status_code, 'response': str(e)}
+        except Exception as e:
+            return {'status_code': 0, 'response': str(e)}
+
+    def _build_auth_header(self) -> str:
+        oauth = {
+            'oauth_consumer_key': self._client_id,
+            'oauth_signature_method': 'HMAC-SHA256',
+            'oauth_timestamp': str(int(time.time())),
+            'oauth_nonce': self._generate_nonce(10)
+        }
+
+        url_base = self.base_url
+        all_params = oauth.copy()
+        base_info = self._build_base_string(url_base, 'GET', all_params)
+        composite_key = quote_plus(self._client_secret) + "&"
+        oauth["oauth_signature"] = self._generate_auth_signature(base_info, composite_key)
+
+        auth_parts = [f'{quote_plus(str(k))}="{quote_plus(str(v))}"' for k, v in oauth.items()]
+        auth_header = "OAuth " + ', '.join(auth_parts)
+        return auth_header
+
+    def _generate_nonce(self, nonce_len: int) -> str:
+        characters = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+        return ''.join(characters[randint(0, len(characters) - 1)] for _ in range(nonce_len))
+
+    def _build_base_string(self, baseurl: str, method: str, all_params: dict) -> str:
+        sorted_params = OrderedDict(sorted(all_params.items()))
+        param_str = '&'.join(f"{quote(str(k))}={quote(str(v))}" for k, v in sorted_params.items())
+        return f"{method}&{quote_plus(baseurl)}&{quote_plus(param_str)}"
+
+    def _generate_auth_signature(self, base_info: str, composite_key: str) -> str:
+        digest = hmac.new(composite_key.encode(), msg=base_info.encode(), digestmod=hashlib.sha256).digest()
+        return base64.b64encode(digest).decode()
+
+# Usage example:
+if __name__ == "__main__":
+    roster = OneRoster()
+    roster.fetch_all_data()
