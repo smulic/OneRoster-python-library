@@ -1,0 +1,85 @@
+require 'net/http'
+require 'uri'
+require 'openssl'
+require 'base64'
+require 'json'
+require 'dotenv/load'  # Make sure to include the dotenv gem in your Gemfile or install it
+
+class OneRoster
+  attr_accessor :client_id, :client_secret, :base_url, :collections
+
+  def initialize
+    @client_id = ENV['CLIENT_ID']
+    @client_secret = ENV['CLIENT_SECRET']
+    @base_url = 'https://api.classlink.com/oneroster'
+    @collections = ['academicSessions', 'orgs', 'courses', 'classes', 'users', 'enrollments', 'demographics']
+  end
+
+  def fetch_all_data
+    @collections.each do |collection|
+      url = "#{@base_url}/#{collection}"
+      fetch_collection(url)
+    end
+  end
+
+  def fetch_collection(url)
+    limit = 10000
+    offset = 0
+    total_count = nil
+    running_total = 0
+
+    while total_count.nil? || running_total < total_count
+      response = make_roster_request(url, limit, offset)
+      if response.code != '200'
+        puts "Error: #{response.code}"
+        handle_rate_limits(response.code)
+        next
+      end
+      data = JSON.parse(response.body)
+      count = data.size
+      running_total += count
+      total_count = response['x-total-count'].to_i
+      offset += limit
+    end
+  end
+
+  def make_roster_request(url, limit, offset)
+    uri = URI("#{url}?limit=#{limit}&offset=#{offset}")
+    request = Net::HTTP::Get.new(uri)
+    request['Authorization'] = build_auth_header
+
+    Net::HTTP.start(uri.hostname, uri.port, use_ssl: uri.scheme == 'https') do |http|
+      http.request(request)
+    end
+  end
+
+  def handle_rate_limits(code)
+    sleep(60) if code == '429' || code == '502'  # Simple backoff strategy
+  end
+
+  def build_auth_header
+    method = 'GET'
+    timestamp = Time.now.to_i.to_s
+    nonce = generate_nonce(10)
+    signature = generate_auth_signature(method, timestamp, nonce)
+
+    "OAuth oauth_signature=\"#{signature}\""
+  end
+
+  def generate_nonce(length)
+    rand(36**length).to_s(36)
+  end
+
+  def generate_auth_signature(method, timestamp, nonce)
+    base_string = "#{method}&#{@base_url}&oauth_consumer_key=#{@client_id}&oauth_nonce=#{nonce}&oauth_signature_method=HMAC-SHA256&oauth_timestamp=#{timestamp}"
+    key = "#{@client_secret}&"
+    
+    digest = OpenSSL::Digest.new('sha256')
+    hmac = OpenSSL::HMAC.digest(digest, key, base_string)
+    Base64.strict_encode64(hmac)
+  end
+end
+
+# Usage example:
+roster = OneRoster.new
+roster.fetch_all_data
