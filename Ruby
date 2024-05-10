@@ -11,7 +11,7 @@ class OneRoster
   def initialize
     @client_id = ENV['CLIENT_ID']
     @client_secret = ENV['CLIENT_SECRET']
-    @base_url = 'https://api.classlink.com/oneroster'
+    @base_url = ENV['BASE_URL']
     @collections = ['academicSessions', 'orgs', 'courses', 'classes', 'users', 'enrollments', 'demographics']
   end
 
