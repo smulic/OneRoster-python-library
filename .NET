@@ -1,0 +1,113 @@
+using System;
+using System.Collections.Generic;
+using System.Net.Http;
+using System.Text;
+using System.Threading.Tasks;
+using System.Security.Cryptography;
+using Microsoft.Extensions.Configuration; // Make sure to include Microsoft.Extensions.Configuration and Configuration.Json packages
+
+public class OneRoster
+{
+    private readonly string clientId;
+    private readonly string clientSecret;
+    private readonly string baseUrl = "https://api.classlink.com/oneroster";
+    private readonly string[] collections = { "academicSessions", "orgs", "courses", "classes", "users", "enrollments", "demographics" };
+    private readonly HttpClient httpClient = new HttpClient();
+
+    public OneRoster(IConfiguration configuration)
+    {
+        clientId = configuration["CLIENT_ID"];
+        clientSecret = configuration["CLIENT_SECRET"];
+    }
+
+    public async Task FetchAllDataAsync()
+    {
+        foreach (var collection in collections)
+        {
+            string url = $"{baseUrl}/{collection}";
+            await FetchCollectionAsync(url);
+        }
+    }
+
+    private async Task FetchCollectionAsync(string url)
+    {
+        int limit = 10000;
+        int offset = 0;
+        int totalCount = -1;
+        int runningTotal = 0;
+
+        while (totalCount == -1 || runningTotal < totalCount)
+        {
+            var response = await MakeRosterRequestAsync(url, limit, offset);
+            if (!response.IsSuccessStatusCode)
+            {
+                Console.WriteLine($"Error: {response.StatusCode}");
+                continue;
+            }
+
+            var content = await response.Content.ReadAsStringAsync();
+            var count = CountData(content); // Assume CountData is implemented to parse and count the data
+            runningTotal += count;
+            totalCount = int.Parse(response.Headers.GetValues("x-total-count").ToString());
+            offset += limit;
+        }
+    }
+
+    private async Task<HttpResponseMessage> MakeRosterRequestAsync(string url, int limit, int offset)
+    {
+        var requestUrl = $"{url}?limit={limit}&offset={offset}";
+        var request = new HttpRequestMessage(HttpMethod.Get, requestUrl);
+        request.Headers.Add("Authorization", BuildAuthHeader());
+        return await httpClient.SendAsync(request);
+    }
+
+    private string BuildAuthHeader()
+    {
+        string method = "GET";
+        string timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds().ToString();
+        string nonce = GenerateNonce(10);
+        string signature = GenerateAuthSignature(method, timestamp, nonce);
+        return $"OAuth oauth_signature=\"{Uri.EscapeDataString(signature)}\"";
+    }
+
+    private string GenerateNonce(int length)
+    {
+        const string chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+        var random = new Random();
+        var nonce = new char[length];
+        for (int i = 0; i < nonce.Length; i++)
+        {
+            nonce[i] = chars[random.Next(chars.Length)];
+        }
+        return new string(nonce);
+    }
+
+    private string GenerateAuthSignature(string method, string timestamp, string nonce)
+    {
+        var baseString = $"{method}&{Uri.EscapeDataString(baseUrl)}&oauth_consumer_key={clientId}&oauth_nonce={nonce}&oauth_signature_method=HMAC-SHA256&oauth_timestamp={timestamp}";
+        using var hmac = new HMACSHA256(Encoding.UTF8.GetBytes($"{clientSecret}&"));
+        var hash = hmac.ComputeHash(Encoding.UTF8.GetBytes(baseString));
+        return Convert.ToBase64String(hash);
+    }
+
+    // Implement your data counting logic here
+    private int CountData(string jsonData)
+    {
+        // Dummy implementation: Parse JSON and count elements
+        return 10;
+    }
+}
+
+// In your Program.cs or Startup.cs:
+public class Program
+{
+    public static async Task Main(string[] args)
+    {
+        IConfiguration config = new ConfigurationBuilder()
+            .AddJsonFile("appsettings.json")
+            .Build();
+
+        var oneRoster = new OneRoster(config);
+        await oneRoster.FetchAllDataAsync();
+    }
+}
