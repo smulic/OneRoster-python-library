@@ -1,0 +1,118 @@
+package main
+
+import (
+    "encoding/base64"
+    "crypto/hmac"
+    "crypto/sha256"
+    "fmt"
+    "io/ioutil"
+    "math/rand"
+    "net/http"
+    "net/url"
+    "os"
+    "strconv"
+    "strings"
+    "time"
+)
+
+type OneRoster struct {
+    clientID     string
+    clientSecret string
+    baseURL      string
+    collections  []string
+    httpClient   *http.Client
+}
+
+func NewOneRoster() *OneRoster {
+    return &OneRoster{
+        clientID:     os.Getenv("CLIENT_ID"),
+        clientSecret: os.Getenv("CLIENT_SECRET"),
+        baseURL:      "https://api.classlink.com/oneroster",
+        collections:  []string{"academicSessions", "orgs", "courses", "classes", "users", "enrollments", "demographics"},
+        httpClient:   &http.Client{},
+    }
+}
+
+func (or *OneRoster) FetchAllData() {
+    for _, collection := range or.collections {
+        url := fmt.Sprintf("%s/%s", or.baseURL, collection)
+        or.fetchCollection(url)
+    }
+}
+
+func (or *OneRoster) fetchCollection(url string) {
+    limit := 10000
+    offset := 0
+    totalCount := -1
+    runningTotal := 0
+
+    for totalCount == -1 || runningTotal < totalCount {
+        resp, err := or.makeRosterRequest(url, limit, offset)
+        if err != nil {
+            fmt.Println("Error making request:", err)
+            continue
+        }
+        body, err := ioutil.ReadAll(resp.Body)
+        resp.Body.Close()
+        if err != nil {
+            fmt.Println("Error reading response body:", err)
+            continue
+        }
+
+        // Simulate JSON parsing and counting
+        count := strings.Count(string(body), "someDelimiter")
+        runningTotal += count
+        totalCountStr := resp.Header.Get("x-total-count")
+        if totalCountStr != "" {
+            totalCount, _ = strconv.Atoi(totalCountStr)
+        }
+
+        offset += limit
+    }
+}
+
+func (or *OneRoster) makeRosterRequest(url string, limit, offset int) (*http.Response, error) {
+    reqURL := fmt.Sprintf("%s?limit=%d&offset=%d", url, limit, offset)
+    req, err := http.NewRequest("GET", reqURL, nil)
+    if err != nil {
+        return nil, err
+    }
+    req.Header.Set("Authorization", or.buildAuthHeader())
+
+    return or.httpClient.Do(req)
+}
+
+func (or *OneRoster) buildAuthHeader() string {
+    method := "GET"
+    timestamp := strconv.FormatInt(time.Now().Unix(), 10)
+    nonce := generateNonce(10)
+    signature := or.generateAuthSignature(method, timestamp, nonce)
+
+    return fmt.Sprintf("OAuth oauth_signature=\"%s\"", url.QueryEscape(signature))
+}
+
+func (or *OneRoster) generateAuthSignature(method, timestamp, nonce string) string {
+    baseString := fmt.Sprintf("%s&%s&oauth_consumer_key=%s&oauth_nonce=%s&oauth_signature_method=HMAC-SHA256&oauth_timestamp=%s",
+        method, or.baseURL, or.clientID, nonce, timestamp)
+
+    key := fmt.Sprintf("%s&", url.QueryEscape(or.clientSecret))
+    mac := hmac.New(sha256.New, []byte(key))
+    mac.Write([]byte(baseString))
+    signature := base64.StdEncoding.EncodeToString(mac.Sum(nil))
+
+    return signature
+}
+
+func generateNonce(length int) string {
+    letters := []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+    nonce := make([]rune, length)
+    for i := range nonce {
+        nonce[i] = letters[rand.Intn(len(letters))]
+    }
+    return string(nonce)
+}
+
+func main() {
+    roster := NewOneRoster()
+    roster.FetchAllData()
+}
