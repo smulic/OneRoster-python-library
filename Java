@@ -23,7 +23,7 @@ public class OneRoster {
     public OneRoster() {
         this.clientId = System.getenv("CLIENT_ID");
         this.clientSecret = System.getenv("CLIENT_SECRET");
-        this.baseUrl = "https://api.classlink.com/oneroster";
+        this.baseUrl = System.getenv("BASE_URL");
     }
 
     public void fetchAllData() throws IOException, InterruptedException {
