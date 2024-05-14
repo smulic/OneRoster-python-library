@@ -50,7 +50,6 @@ class OneRoster:
             final_res.append(page_data)
             count = len(page_data)
             running_total += count
-            print("im here")
             if 'x-total-count' in data:
                 total_count = int(data['x-total-count'])
             offset += limit
