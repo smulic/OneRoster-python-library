@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 
 class OneRoster:
     def __init__(self):
-        load_dotenv
+        load_dotenv()
         # Load API credentials from environment variables for security
         self._client_id = os.getenv('CLIENT_ID')
         self._client_secret = os.getenv('CLIENT_SECRET')
