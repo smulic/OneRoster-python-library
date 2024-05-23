@@ -1,137 +1,248 @@
 import os
 import time
-import random
-from random import randint
-from urllib.parse import quote, quote_plus, unquote
+import urllib.parse
 import hmac
 import base64
 import hashlib
 import requests
+from random import randint
 from collections import OrderedDict
+from typing import Dict, Any, Optional, List
 from dotenv import load_dotenv
 
 
 class OneRoster:
+    # Base URL for the OneRoster API
+    # Endpoints to pull data from
+    ENDPOINTS = [
+        "/academicSessions",
+        "/orgs",
+        "/courses",
+        "/classes",
+        "/users",
+        "/enrollments",
+        "/demographics"
+    ]
+    # Page size for API requests
+    PAGE_SIZE = 10000
+
     def __init__(self):
         load_dotenv()
-        # Load API credentials from environment variables for security
+        # Initialize the OneRoster client with client ID and secret
         self._client_id = os.getenv('CLIENT_ID')
         self._client_secret = os.getenv('CLIENT_SECRET')
         # Base URL for all API requests
         self.base_url = os.getenv('BASE_URL')
-        # List of data collections to be fetched
-        self.collections = ["academicSessions", "orgs", "courses", "classes", "users", "enrollments", "demographics"]
-        self.responseCount = 0
 
-    def fetch_all_data(self):
-        # Iterate over each collection and fetch all data
-        for collection in self.collections:
-            url = f"{self.base_url}/{collection}"
-            self._fetch_collection(url, collection)
+    def make_roster_request(self, endpoint: str, limit: int = PAGE_SIZE, offset: int = 0) -> Dict[str, Any]:
+        """
+        Make a request to the specified endpoint with pagination parameters.
 
-    def _fetch_collection(self, url: str, collection: str):
-        # Pagination settings: fetch data in batches of 10,000 records
-        limit = 10000
-        offset = 0
-        total_count = None
-        running_total = 0
-        retries = 0
-        final_res = []
-
-        # Continue fetching data until all records are retrieved
-        while total_count is None or running_total < total_count:
-            data = self.make_roster_request(url, limit, offset)
-            # Check for HTTP error statuses
-            if 'status_code' in data and data['status_code'] != 200:
-                if data['status_code'] in [*range(429, 503, 1)]:
-                    retries = self._handle_rate_limits(retries, data['status_code'])
-                continue
-            page_data = data['response'][collection]
-            final_res.append(page_data)
-            count = len(page_data)
-            running_total += count
-            if 'x-total-count' in data:
-                total_count = int(data['x-total-count'])
-            offset += limit
-            print(f"running total: {running_total}")
-            print(f"total count: {total_count}")
-        return final_res
-
-    def make_roster_request(self, url: str, limit: int, offset: int) -> dict:
-        # Append pagination parameters to the URL
-        # url += f"?limit={limit}&offset={offset}"
-        return self._make_get_request(url)
-
-    # def _handle_rate_limits(self, retries: int, error_code: int):
-    #     # Exponential backoff with jitter for handling rate limits and server errors
-    #     wait_time = (2 ** retries) + random.uniform(0, 1)
-    #     time.sleep(wait_time)
-    #     retries += 1
-    #     if retries > 5:  # Prevent infinite retry loops
-    #         print(f"API request failed after several retries due to error {error_code}")
-    #         raise Exception(f"API request failed after several retries due to error {error_code}")
-    #     return retries
-
-    def _handle_rate_limits(self, retries, error_code):
-        if error_code in [500, 502, 503, 429]:  # Including common server error codes
-            wait_time = (2 ** retries) + random.uniform(0, 1)
-            print(f"Rate limit or server error encountered. Waiting {wait_time:.2f} seconds before retrying...")
-            time.sleep(wait_time)
-            retries += 1
-            if retries >= 5:
-                raise Exception(f"API request failed after {retries} retries due to error {error_code}")
-        return retries
-
-    def _make_get_request(self, url: str) -> dict:
-        # Execute the HTTP GET request with OAuth authentication
-        try:
-            response = requests.get(url=url, headers={'Authorization': self._build_auth_header(url)})
-            self.responseCount += 1
-            response.raise_for_status()
-            return {
-                'status_code': response.status_code,
-                'response': response.json(),
-                'x-total-count': response.headers.get('x-total-count')
-            }
-        except requests.exceptions.HTTPError as e:
-            print(str(e))
-            return {'status_code': e.response.status_code, 'response': str(e)}
-        except Exception as e:
-            return {'status_code': 0, 'response': str(e)}
-
-    def _build_auth_header(self, url) -> str:
-        # Construct OAuth authorization header with signature
+        :param endpoint: The API endpoint to request data from
+        :param limit: Number of records per page
+        :param offset: Offset for pagination
+        :return: A dictionary containing the status code, response data, and headers
+        """
+        # Construct the URL with pagination parameters
+        url = f"{self.base_url}{endpoint}?limit={limit}&offset={offset}"
+        # Generate timestamp and nonce for OAuth
         timestamp = str(int(time.time()))
         nonce = self._generate_nonce(len(timestamp))
-        oauth = {
+
+        # OAuth parameters
+        oauth_params = {
             'oauth_consumer_key': self._client_id,
             'oauth_signature_method': 'HMAC-SHA256',
             'oauth_timestamp': timestamp,
             'oauth_nonce': nonce
         }
-        base_info = self._build_base_string(url, 'GET', oauth)
-        composite_key = quote_plus(self._client_secret) + "&"
-        oauth["oauth_signature"] = self._generate_auth_signature(base_info, composite_key)
-        auth_parts = [f'{quote_plus(str(k))}="{quote_plus(str(v))}"' for k, v in oauth.items()]
-        return "OAuth " + ','.join(auth_parts)
 
-    def _generate_nonce(self, nonce_len: int) -> str:
-        # Generate a random string (nonce) for OAuth signature uniqueness
+        # Split URL into base URL and parameters
+        base_url, url_params = self._split_url(url)
+        # Merge OAuth parameters with URL parameters
+        all_params = self._merge_dicts(oauth_params, url_params)
+
+        # Create the base string for the OAuth signature
+        base_string = self._build_base_string(base_url, 'GET', all_params)
+        # Create the composite key for HMAC
+        composite_key = urllib.parse.quote_plus(self._client_secret) + "&"
+        # Generate the OAuth signature
+        auth_signature = self._generate_auth_signature(base_string, composite_key)
+        oauth_params["oauth_signature"] = auth_signature
+
+        # Build the OAuth authorization header
+        auth_header = self._build_auth_header(oauth_params)
+
+        # Make the GET request to the API
+        return self._make_get_request(base_url, auth_header, url_params)
+
+    def pull_complete_data_set(self) -> Dict[str, List[Dict[str, Any]]]:
+        """
+        Pull the complete data set from all defined endpoints.
+
+        :return: A dictionary containing data from all endpoints
+        """
+        all_data = {}
+        # Loop through each endpoint to pull all data
+        for endpoint in self.ENDPOINTS:
+            all_data[endpoint] = self._pull_all_data(endpoint)
+        return all_data
+
+    def _pull_all_data(self, endpoint: str) -> List[Dict[str, Any]]:
+        """
+        Pull all data from a specified endpoint using pagination.
+
+        :param endpoint: The API endpoint to pull data from
+        :return: A list of all records from the endpoint
+        """
+        data = []
+        offset = 0
+        total_count = None
+
+        while len(data) != total_count:
+            # Make the API request with retries
+            response = self._make_request_with_retries(endpoint, offset=offset)
+            if response["status_code"] != 200:
+                code = response["status_code"]
+                print(f"Error in request to endpoint {endpoint} - {code}")
+
+            # Get the current page of data
+            responseName = endpoint.replace("/","")
+            current_data = response["response"][responseName]
+            data.extend(current_data)
+            
+
+            # Set total_count on the first request
+            if total_count is None:
+                total_count = int(response["headers"].get("x-total-count", len(current_data)))
+
+            # Update the offset for the next page
+            offset += self.PAGE_SIZE
+
+        return data
+
+    def _make_request_with_retries(self, endpoint: str, limit: int = PAGE_SIZE, offset: int = 0) -> Dict[str, Any]:
+        """
+        Make a request with retries in case of rate limiting or server errors.
+
+        :param endpoint: The API endpoint to request data from
+        :param limit: Number of records per page
+        :param offset: Offset for pagination
+        :return: A dictionary containing the status code, response data, and headers
+        """
+        retries = 0
+        max_retries = 3
+        base_wait_time = 1
+
+        while retries < max_retries:
+            response = self.make_roster_request(endpoint, limit, offset)
+            if response["status_code"] == 200:
+                return response
+            elif response["status_code"] in {429, 502}:
+                # Apply exponential backoff with jitter
+                wait_time = base_wait_time * (2 ** retries) + randint(0, 1000) / 1000
+                time.sleep(wait_time)
+                retries += 1
+            else:
+                return response
+
+        return {"status_code": response["status_code"], "response": "Max retries exceeded"}
+
+    @staticmethod
+    def _merge_dicts(oauth: Dict[str, str], params: Dict[str, str]) -> Dict[str, str]:
+        """
+        Merge OAuth and URL parameter dictionaries.
+
+        :param oauth: OAuth parameters
+        :param params: URL parameters
+        :return: A merged dictionary of parameters
+        """
+        return {**oauth, **params}
+
+    @staticmethod
+    def _generate_nonce(length: int) -> str:
+        """
+        Generate a random nonce.
+
+        :param length: Length of the nonce
+        :return: The generated nonce
+        """
         characters = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-        return ''.join(characters[randint(0, len(characters) - 1)] for _ in range(nonce_len))
+        return ''.join(characters[randint(0, len(characters) - 1)] for _ in range(length))
 
-    def _build_base_string(self, baseurl: str, method: str, all_params: dict) -> str:
-        # Create the base string used in OAuth signature
-        sorted_params = OrderedDict(sorted(all_params.items()))
-        param_str = '&'.join(f"{quote(str(k))}={quote(str(v))}" for k, v in sorted_params.items())
-        return f"{method}&{quote_plus(baseurl)}&{quote_plus(param_str)}"
+    @staticmethod
+    def _split_url(url: str) -> (str, Dict[str, str]):
+        """
+        Split the URL into base URL and parameters.
 
-    def _generate_auth_signature(self, base_info: str, composite_key: str) -> str:
-        # Generate the OAuth signature using HMAC-SHA256
-        digest = hmac.new(composite_key.encode(), msg=str.encode(base_info), digestmod=hashlib.sha256).digest()
+        :param url: The URL to split
+        :return: The base URL and parameters dictionary
+        """
+        if '?' in url:
+            base_url, query_string = url.split('?', 1)
+            url_params = {k: v for k, v in (param.split('=') for param in query_string.split('&'))}
+        else:
+            base_url = url
+            url_params = {}
+        return base_url, url_params
+
+    @staticmethod
+    def _build_base_string(base_url: str, method: str, params: Dict[str, str]) -> str:
+        """
+        Generate the base string for OAuth signature generation.
+
+        :param base_url: The base URL
+        :param method: The HTTP method
+        :param params: The URL and OAuth parameters
+        :return: The base string for OAuth signature generation
+        """
+        encoded_params = '&'.join(f"{k}={urllib.parse.quote(v, safe='')}" for k, v in sorted(params.items()))
+        return f"{method}&{urllib.parse.quote_plus(base_url)}&{urllib.parse.quote_plus(encoded_params)}"
+
+    @staticmethod
+    def _generate_auth_signature(base_string: str, composite_key: str) -> str:
+        """
+        Generate the OAuth signature.
+
+        :param base_string: The base string for the OAuth signature
+        :param composite_key: The composite key for HMAC
+        :return: The generated OAuth signature
+        """
+        digest = hmac.new(composite_key.encode(), base_string.encode(), hashlib.sha256).digest()
         return base64.b64encode(digest).decode()
 
-# Usage example:
+    @staticmethod
+    def _build_auth_header(oauth: Dict[str, str]) -> str:
+        """
+        Generate the OAuth authorization header.
+
+        :param oauth: OAuth parameters
+        :return: The OAuth authorization header
+        """
+        header_params = ', '.join(f'{k}="{urllib.parse.quote_plus(v)}"' for k, v in oauth.items())
+        return f"OAuth {header_params}"
+
+    @staticmethod
+    def _make_get_request(url: str, auth_header: str, params: Optional[Dict[str, str]]) -> Dict[str, Any]:
+        """
+        Make a GET request to the API.
+
+        :param url: The base URL of the request
+        :param auth_header: The OAuth authorization header
+        :param params: URL parameters
+        :return: A dictionary containing the status code, response data, and headers
+        """
+        try:
+            response = requests.get(url, headers={"Authorization": auth_header}, params=params)
+            return {
+                "status_code": response.status_code,
+                "response": response.json(),
+                "headers": response.headers
+            }
+        except requests.RequestException as e:
+            return {"status_code": 0, "response": f"An error occurred: {e}"}
+        
 if __name__ == "__main__":
     roster = OneRoster()
-    roster.fetch_all_data()
+    data = roster.pull_complete_data_set()
+    print(data)
