@@ -39,9 +39,11 @@ class OneRoster {
          */
         // Construct the URL with pagination parameters
         const url = `${this.base_url}${endpoint}?limit=${limit}&offset=${offset}`;
+        console.log("Request URL:", url);
+
         // Generate timestamp and nonce for OAuth
         const timestamp = Math.floor(Date.now() / 1000).toString();
-        const nonce = this._generateNonce(timestamp.length);
+        const nonce = this._generateNonce(10);
 
         // OAuth parameters
         const oauthParams = {
@@ -58,6 +60,8 @@ class OneRoster {
 
         // Create the base string for the OAuth signature
         const baseString = this._buildBaseString(baseUrl, 'GET', allParams);
+        console.log("Base String:", baseString);
+
         // Create the composite key for HMAC
         const compositeKey = `${querystring.escape(this._client_secret)}&`;
         // Generate the OAuth signature
@@ -66,6 +70,7 @@ class OneRoster {
 
         // Build the OAuth authorization header
         const authHeader = this._buildAuthHeader(oauthParams);
+        console.log("Authorization Header:", authHeader);
 
         // Make the GET request to the API
         return this._makeGetRequest(baseUrl, authHeader, urlParams);
@@ -96,7 +101,7 @@ class OneRoster {
         let offset = 0;
         let totalCount = null;
 
-        while (data.length !== totalCount) {
+        while (true) {
             // Make the API request with retries
             const response = await this._makeRequestWithRetries(endpoint, OneRoster.PAGE_SIZE, offset);
             if (response.status_code !== 200) {
@@ -116,6 +121,9 @@ class OneRoster {
 
             // Update the offset for the next page
             offset += OneRoster.PAGE_SIZE;
+
+            // Break the loop if all data is fetched
+            if (data.length >= totalCount) break;
         }
 
         return data;
@@ -148,7 +156,7 @@ class OneRoster {
             }
         }
 
-        return { status_code: response.status_code, response: "Max retries exceeded" };
+        return { status_code: 500, response: "Max retries exceeded" };
     }
 
     _generateNonce(length) {
@@ -240,7 +248,8 @@ class OneRoster {
                 headers: response.headers
             };
         } catch (error) {
-            return { status_code: 0, response: `An error occurred: ${error.message}` };
+            console.error("Request failed:", error.message);
+            return { status_code: 500, response: `An error occurred: ${error.message}` };
         }
     }
 
@@ -259,5 +268,5 @@ class OneRoster {
 (async () => {
     const roster = new OneRoster();
     const data = await roster.pullCompleteDataSet();
-    console.log(data);
+    console.log(JSON.stringify(data, null, 2));
 })();
