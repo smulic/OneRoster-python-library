@@ -1,9 +1,7 @@
 const axios = require('axios');
 const crypto = require('crypto');
 const querystring = require('querystring');
-const dotenv = require('dotenv');
-
-dotenv.config();
+const dotenv = require('dotenv').config();
 
 class OneRoster {
     // Endpoints to pull data from
@@ -39,7 +37,6 @@ class OneRoster {
          */
         // Construct the URL with pagination parameters
         const url = `${this.base_url}${endpoint}?limit=${limit}&offset=${offset}`;
-        console.log("Request URL:", url);
 
         // Generate timestamp and nonce for OAuth
         const timestamp = Math.floor(Date.now() / 1000).toString();
@@ -60,7 +57,6 @@ class OneRoster {
 
         // Create the base string for the OAuth signature
         const baseString = this._buildBaseString(baseUrl, 'GET', allParams);
-        console.log("Base String:", baseString);
 
         // Create the composite key for HMAC
         const compositeKey = `${querystring.escape(this._client_secret)}&`;
@@ -70,7 +66,6 @@ class OneRoster {
 
         // Build the OAuth authorization header
         const authHeader = this._buildAuthHeader(oauthParams);
-        console.log("Authorization Header:", authHeader);
 
         // Make the GET request to the API
         return this._makeGetRequest(baseUrl, authHeader, urlParams);
