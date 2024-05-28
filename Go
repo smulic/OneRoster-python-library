@@ -1,118 +1,224 @@
 package main
 
 import (
-    "encoding/base64"
-    "crypto/hmac"
-    "crypto/sha256"
-    "fmt"
-    "io/ioutil"
-    "math/rand"
-    "net/http"
-    "net/url"
-    "os"
-    "strconv"
-    "strings"
-    "time"
+	"encoding/base64"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/json"
+	"fmt"
+	"io/ioutil"
+	"net/http"
+	"net/url"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+	"math/rand"
+	"github.com/joho/godotenv"
 )
 
+const (
+	PageSize = 10000
+	MaxRetries = 3
+	BaseWaitTime = 1
+)
+
+var endpoints = []string{
+	"/academicSessions",
+	"/orgs",
+	"/courses",
+	"/classes",
+	"/users",
+	"/enrollments",
+	"/demographics",
+}
+
 type OneRoster struct {
-    clientID     string
-    clientSecret string
-    baseURL      string
-    collections  []string
-    httpClient   *http.Client
+	ClientID     string
+	ClientSecret string
+	BaseURL      string
 }
 
+type Response struct {
+	StatusCode int
+	Response   map[string]interface{}
+	Headers    http.Header
+}
+
+// Initialize the OneRoster client with client ID and secret from environment variables
 func NewOneRoster() *OneRoster {
-    return &OneRoster{
-        clientID:     os.Getenv("CLIENT_ID"),
-        clientSecret: os.Getenv("CLIENT_SECRET"),
-        baseURL:      os.Getenv("BASE_URL"),
-        collections:  []string{"academicSessions", "orgs", "courses", "classes", "users", "enrollments", "demographics"},
-        httpClient:   &http.Client{},
-    }
+	godotenv.Load()
+	return &OneRoster{
+		ClientID:     os.Getenv("CLIENT_ID"),
+		ClientSecret: os.Getenv("CLIENT_SECRET"),
+		BaseURL:      os.Getenv("BASE_URL"),
+	}
 }
 
-func (or *OneRoster) FetchAllData() {
-    for _, collection := range or.collections {
-        url := fmt.Sprintf("%s/%s", or.baseURL, collection)
-        or.fetchCollection(url)
-    }
+// Make a request to the specified endpoint with pagination parameters
+func (o *OneRoster) MakeRosterRequest(endpoint string, limit, offset int) Response {
+	urlStr := fmt.Sprintf("%s%s?limit=%d&offset=%d", o.BaseURL, endpoint, limit, offset)
+	timestamp := strconv.Itoa(int(time.Now().Unix()))
+	nonce := generateNonce(len(timestamp))
+
+	oauthParams := map[string]string{
+		"oauth_consumer_key":     o.ClientID,
+		"oauth_signature_method": "HMAC-SHA256",
+		"oauth_timestamp":        timestamp,
+		"oauth_nonce":            nonce,
+	}
+
+	baseURL, urlParams := splitURL(urlStr)
+	allParams := mergeDicts(oauthParams, urlParams)
+	baseString := buildBaseString(baseURL, "GET", allParams)
+	compositeKey := url.QueryEscape(o.ClientSecret) + "&"
+	authSignature := generateAuthSignature(baseString, compositeKey)
+	oauthParams["oauth_signature"] = authSignature
+	authHeader := buildAuthHeader(oauthParams)
+
+	return makeGetRequest(baseURL, authHeader, urlParams)
 }
 
-func (or *OneRoster) fetchCollection(url string) {
-    limit := 10000
-    offset := 0
-    totalCount := -1
-    runningTotal := 0
-
-    for totalCount == -1 || runningTotal < totalCount {
-        resp, err := or.makeRosterRequest(url, limit, offset)
-        if err != nil {
-            fmt.Println("Error making request:", err)
-            continue
-        }
-        body, err := ioutil.ReadAll(resp.Body)
-        resp.Body.Close()
-        if err != nil {
-            fmt.Println("Error reading response body:", err)
-            continue
-        }
-
-        // Simulate JSON parsing and counting
-        count := strings.Count(string(body), "someDelimiter")
-        runningTotal += count
-        totalCountStr := resp.Header.Get("x-total-count")
-        if totalCountStr != "" {
-            totalCount, _ = strconv.Atoi(totalCountStr)
-        }
-
-        offset += limit
-    }
+// Pull the complete data set from all defined endpoints
+func (o *OneRoster) PullCompleteDataSet() map[string][]map[string]interface{} {
+	allData := make(map[string][]map[string]interface{})
+	for _, endpoint := range endpoints {
+		allData[endpoint] = o.pullAllData(endpoint)
+	}
+	return allData
 }
 
-func (or *OneRoster) makeRosterRequest(url string, limit, offset int) (*http.Response, error) {
-    reqURL := fmt.Sprintf("%s?limit=%d&offset=%d", url, limit, offset)
-    req, err := http.NewRequest("GET", reqURL, nil)
-    if err != nil {
-        return nil, err
-    }
-    req.Header.Set("Authorization", or.buildAuthHeader())
+// Pull all data from a specified endpoint using pagination
+func (o *OneRoster) pullAllData(endpoint string) []map[string]interface{} {
+	var data []map[string]interface{}
+	offset := 0
+	var totalCount int
 
-    return or.httpClient.Do(req)
+	for {
+		response := o.makeRequestWithRetries(endpoint, PageSize, offset)
+		if response.StatusCode != 200 {
+			fmt.Printf("Error in request to endpoint %s - %d\n", endpoint, response.StatusCode)
+		}
+		
+		responseName := strings.Replace(endpoint, "/", "", -1)
+		currentData := response.Response[responseName].([]interface{})
+		for _, item := range currentData {
+			data = append(data, item.(map[string]interface{}))
+		}
+
+		if totalCount == 0 {
+			totalCount, _ = strconv.Atoi(response.Headers.Get("x-total-count"))
+		}
+		
+		offset += PageSize
+		if len(currentData) == 0 || len(data) >= totalCount {
+			break
+		}
+	}
+
+	return data
 }
 
-func (or *OneRoster) buildAuthHeader() string {
-    method := "GET"
-    timestamp := strconv.FormatInt(time.Now().Unix(), 10)
-    nonce := generateNonce(10)
-    signature := or.generateAuthSignature(method, timestamp, nonce)
+// Make a request with retries in case of rate limiting or server errors
+func (o *OneRoster) makeRequestWithRetries(endpoint string, limit, offset int) Response {
+	retries := 0
 
-    return fmt.Sprintf("OAuth oauth_signature=\"%s\"", url.QueryEscape(signature))
+	for retries < MaxRetries {
+		response := o.MakeRosterRequest(endpoint, limit, offset)
+		if response.StatusCode == 200 {
+			return response
+		} else if response.StatusCode == 429 || response.StatusCode == 502 {
+			waitTime := BaseWaitTime * (1 << retries) + rand.Intn(1000) / 1000
+			time.Sleep(time.Duration(waitTime) * time.Second)
+			retries++
+		} else {
+			return response
+		}
+	}
+
+	return Response{StatusCode: 0, Response: map[string]interface{}{"error": "Max retries exceeded"}}
 }
 
-func (or *OneRoster) generateAuthSignature(method, timestamp, nonce string) string {
-    baseString := fmt.Sprintf("%s&%s&oauth_consumer_key=%s&oauth_nonce=%s&oauth_signature_method=HMAC-SHA256&oauth_timestamp=%s",
-        method, or.baseURL, or.clientID, nonce, timestamp)
-
-    key := fmt.Sprintf("%s&", url.QueryEscape(or.clientSecret))
-    mac := hmac.New(sha256.New, []byte(key))
-    mac.Write([]byte(baseString))
-    signature := base64.StdEncoding.EncodeToString(mac.Sum(nil))
-
-    return signature
+// Merge OAuth and URL parameter dictionaries
+func mergeDicts(oauth, params map[string]string) map[string]string {
+	merged := make(map[string]string)
+	for k, v := range oauth {
+		merged[k] = v
+	}
+	for k, v := range params {
+		merged[k] = v
+	}
+	return merged
 }
 
+// Generate a random nonce
 func generateNonce(length int) string {
-    letters := []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
-    nonce := make([]rune, length)
-    for i := range nonce {
-        nonce[i] = letters[rand.Intn(len(letters))]
-    }
-    return string(nonce)
+	const characters = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+	nonce := make([]byte, length)
+	for i := range nonce {
+		nonce[i] = characters[rand.Intn(len(characters))]
+	}
+	return string(nonce)
+}
+
+// Split the URL into base URL and parameters
+func splitURL(urlStr string) (string, map[string]string) {
+	u, _ := url.Parse(urlStr)
+	params := make(map[string]string)
+	for k, v := range u.Query() {
+		params[k] = v[0]
+	}
+	return u.Scheme + "://" + u.Host + u.Path, params
+}
+
+// Generate the base string for OAuth signature generation
+func buildBaseString(baseURL, method string, params map[string]string) string {
+	encodedParams := make([]string, 0, len(params))
+	for k, v := range params {
+		encodedParams = append(encodedParams, fmt.Sprintf("%s=%s", k, url.QueryEscape(v)))
+	}
+	return fmt.Sprintf("%s&%s&%s", method, url.QueryEscape(baseURL), url.QueryEscape(strings.Join(encodedParams, "&")))
+}
+
+// Generate the OAuth signature
+func generateAuthSignature(baseString, compositeKey string) string {
+	h := hmac.New(sha256.New, []byte(compositeKey))
+	h.Write([]byte(baseString))
+	return base64.StdEncoding.EncodeToString(h.Sum(nil))
+}
+
+// Generate the OAuth authorization header
+func buildAuthHeader(oauthParams map[string]string) string {
+	headerParams := make([]string, 0, len(oauthParams))
+	for k, v := range oauthParams {
+		headerParams = append(headerParams, fmt.Sprintf(`%s="%s"`, k, url.QueryEscape(v)))
+	}
+	return "OAuth " + strings.Join(headerParams, ", ")
+}
+
+// Make a GET request to the API
+func makeGetRequest(urlStr, authHeader string, params map[string]string) Response {
+	client := &http.Client{}
+	req, _ := http.NewRequest("GET", urlStr, nil)
+	req.Header.Add("Authorization", authHeader)
+	q := req.URL.Query()
+	for k, v := range params {
+		q.Add(k, v)
+	}
+	req.URL.RawQuery = q.Encode()
+	resp, err := client.Do(req)
+	if err != nil {
+		return Response{StatusCode: 0, Response: map[string]interface{}{"error": err.Error()}}
+	}
+	defer resp.Body.Close()
+	body, _ := ioutil.ReadAll(resp.Body)
+	var responseData map[string]interface{}
+	json.Unmarshal(body, &responseData)
+	return Response{StatusCode: resp.StatusCode, Response: responseData, Headers: resp.Header}
 }
 
 func main() {
-    roster := NewOneRoster()
-    roster.FetchAllData()
+	roster := NewOneRoster()
+	data := roster.PullCompleteDataSet()
+	fmt.Println(data)
 }
