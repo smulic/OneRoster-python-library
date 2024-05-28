@@ -1,134 +1,235 @@
 import java.io.IOException;
-import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
-import java.net.http.HttpHeaders;
+import java.io.InputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
 import java.net.URLEncoder;
+import java.security.InvalidKeyException;
 import java.security.NoSuchAlgorithmException;
-import java.util.HashMap;
-import java.util.Map;
-import java.util.Random;
-import java.util.stream.Collectors;
+import java.time.Instant;
+import java.util.*;
+import java.util.concurrent.ThreadLocalRandom;
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 import java.util.Base64;
+import java.util.Properties;
+import java.util.stream.Collectors;
 
 public class OneRoster {
-    private String clientId;
-    private String clientSecret;
-    private String baseUrl;
-    private String[] collections = {"academicSessions", "orgs", "courses", "classes", "users", "enrollments", "demographics"};
+    // Base URL for the OneRoster API
+    private static final List<String> ENDPOINTS = Arrays.asList(
+            "/academicSessions",
+            "/orgs",
+            "/courses",
+            "/classes",
+            "/users",
+            "/enrollments",
+            "/demographics"
+    );
+    // Page size for API requests
+    private static final int PAGE_SIZE = 10000;
+    private final String clientId;
+    private final String clientSecret;
+    private final String baseUrl;
 
-    public OneRoster() {
-        this.clientId = System.getenv("CLIENT_ID");
-        this.clientSecret = System.getenv("CLIENT_SECRET");
-        this.baseUrl = System.getenv("BASE_URL");
-    }
-
-    public void fetchAllData() throws IOException, InterruptedException {
-        for (String collection : collections) {
-            String url = baseUrl + "/" + collection;
-            fetchCollection(url);
-        }
-    }
-
-    private void fetchCollection(String url) throws IOException, InterruptedException {
-        int limit = 10000;
-        int offset = 0;
-        int totalCount = -1;
-        int runningTotal = 0;
-
-        while (totalCount == -1 || runningTotal < totalCount) {
-            HttpResponse<String> response = makeRosterRequest(url, limit, offset);
-            int statusCode = response.statusCode();
-            if (statusCode != 200) {
-                handleRateLimits(statusCode);
-                continue;
+    public OneRoster() throws IOException {
+        Properties props = new Properties();
+        try (InputStream input = getClass().getClassLoader().getResourceAsStream("config.properties")) {
+            if (input == null) {
+                throw new IOException("Unable to find config.properties");
             }
-            Map<String, String> headers = parseHeaders(response.headers());
-            String jsonData = response.body();
-            int count = countData(jsonData); // Implement this based on your JSON structure
-            runningTotal += count;
-            totalCount = Integer.parseInt(headers.get("x-total-count"));
-            offset += limit;
+            props.load(input);
         }
+        // Initialize the OneRoster client with client ID and secret
+        this.clientId = props.getProperty("CLIENT_ID");
+        this.clientSecret = props.getProperty("CLIENT_SECRET");
+        // Base URL for all API requests
+        this.baseUrl = props.getProperty("BASE_URL");
     }
 
-    private HttpResponse<String> makeRosterRequest(String url, int limit, int offset) throws IOException, InterruptedException {
-        HttpClient client = HttpClient.newHttpClient();
-        String fullUrl = String.format("%s?limit=%d&offset=%d", url, limit, offset);
-        HttpRequest request = HttpRequest.newBuilder()
-            .uri(URI.create(fullUrl))
-            .header("Authorization", buildAuthHeader())
-            .build();
-        return client.send(request, HttpResponse.BodyHandlers.ofString());
-    }
-
-    private void handleRateLimits(int statusCode) throws InterruptedException {
-        if (statusCode == 429 || statusCode == 502) {
-            Thread.sleep(1000); // Simple backoff, should be more sophisticated
+    public Map<String, List<Map<String, Object>>> pullCompleteDataSet() throws IOException, NoSuchAlgorithmException, InvalidKeyException {
+        Map<String, List<Map<String, Object>>> allData = new HashMap<>();
+        // Loop through each endpoint to pull all data
+        for (String endpoint : ENDPOINTS) {
+            allData.put(endpoint, pullAllData(endpoint));
         }
+        return allData;
     }
 
-    private String buildAuthHeader() throws NoSuchAlgorithmException {
-        String method = "GET";
-        String timestamp = String.valueOf(System.currentTimeMillis() / 1000);
-        String nonce = generateNonce(10);
-        Map<String, String> params = new HashMap<>();
-        params.put("oauth_consumer_key", clientId);
-        params.put("oauth_signature_method", "HMAC-SHA256");
-        params.put("oauth_timestamp", timestamp);
-        params.put("oauth_nonce", nonce);
+    private List<Map<String, Object>> pullAllData(String endpoint) throws IOException, NoSuchAlgorithmException, InvalidKeyException {
+        List<Map<String, Object>> data = new ArrayList<>();
+        int offset = 0;
+        Integer totalCount = null;
 
-        String baseString = buildBaseString(baseUrl, method, params);
-        String signature = generateAuthSignature(baseString);
-        return "OAuth oauth_signature=\"" + URLEncoder.encode(signature, "UTF-8") + "\"";
+        while (totalCount == null || data.size() != totalCount) {
+            // Make the API request with retries
+            Map<String, Object> response = makeRequestWithRetries(endpoint, PAGE_SIZE, offset);
+            int statusCode = (int) response.get("status_code");
+            if (statusCode != 200) {
+                System.out.println("Error in request to endpoint " + endpoint + " - " + statusCode);
+            }
+
+            // Get the current page of data
+            List<Map<String, Object>> currentData = (List<Map<String, Object>>) response.get("response");
+            data.addAll(currentData);
+
+            // Set totalCount on the first request
+            if (totalCount == null) {
+                totalCount = Integer.parseInt((String) response.get("headers").get("x-total-count"));
+            }
+
+            // Update the offset for the next page
+            offset += PAGE_SIZE;
+        }
+
+        return data;
     }
 
-    private String generateNonce(int length) {
-        Random random = new Random();
-        return random.ints(48, 122)
-                     .filter(i -> (i <= 57 || i >= 65) && (i <= 90 || i >= 97))
-                     .limit(length)
-                     .collect(StringBuilder::new, StringBuilder::appendCodePoint, StringBuilder::append)
-                     .toString();
+    private Map<String, Object> makeRequestWithRetries(String endpoint, int limit, int offset) throws IOException, NoSuchAlgorithmException, InvalidKeyException {
+        int retries = 0;
+        int maxRetries = 3;
+        int baseWaitTime = 1;
+
+        while (retries < maxRetries) {
+            Map<String, Object> response = makeRosterRequest(endpoint, limit, offset);
+            int statusCode = (int) response.get("status_code");
+            if (statusCode == 200) {
+                return response;
+            } else if (statusCode == 429 || statusCode == 502) {
+                // Apply exponential backoff with jitter
+                long waitTime = baseWaitTime * (long) Math.pow(2, retries) + ThreadLocalRandom.current().nextInt(1000) / 1000;
+                try {
+                    Thread.sleep(waitTime * 1000);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("Thread interrupted during backoff wait", e);
+                }
+                retries++;
+            } else {
+                return response;
+            }
+        }
+
+        Map<String, Object> result = new HashMap<>();
+        result.put("status_code", 0);
+        result.put("response", "Max retries exceeded");
+        return result;
     }
 
-    private String buildBaseString(String url, String method, Map<String, String> params) {
-        String paramStr = params.entrySet().stream()
-            .sorted(Map.Entry.comparingByKey())
-            .map(e -> URLEncoder.encode(e.getKey(), "UTF-8") + "=" + URLEncoder.encode(e.getValue(), "UTF-8"))
-            .collect(Collectors.joining("&"));
-        return method + "&" + URLEncoder.encode(url, "UTF-8") + "&" + URLEncoder.encode(paramStr, "UTF-8");
+    private Map<String, Object> makeRosterRequest(String endpoint, int limit, int offset) throws IOException, NoSuchAlgorithmException, InvalidKeyException {
+        String url = String.format("%s%s?limit=%d&offset=%d", baseUrl, endpoint, limit, offset);
+        String timestamp = String.valueOf(Instant.now().getEpochSecond());
+        String nonce = generateNonce(timestamp.length());
+
+        // OAuth parameters
+        Map<String, String> oauthParams = new HashMap<>();
+        oauthParams.put("oauth_consumer_key", clientId);
+        oauthParams.put("oauth_signature_method", "HMAC-SHA256");
+        oauthParams.put("oauth_timestamp", timestamp);
+        oauthParams.put("oauth_nonce", nonce);
+
+        // Split URL into base URL and parameters
+        Map<String, String> urlParams = splitUrl(url);
+        // Merge OAuth parameters with URL parameters
+        Map<String, String> allParams = new HashMap<>(oauthParams);
+        allParams.putAll(urlParams);
+
+        // Create the base string for the OAuth signature
+        String baseString = buildBaseString(url, "GET", allParams);
+        // Create the composite key for HMAC
+        String compositeKey = URLEncoder.encode(clientSecret, "UTF-8") + "&";
+        // Generate the OAuth signature
+        String authSignature = generateAuthSignature(baseString, compositeKey);
+        oauthParams.put("oauth_signature", authSignature);
+
+        // Build the OAuth authorization header
+        String authHeader = buildAuthHeader(oauthParams);
+
+        // Make the GET request to the API
+        return makeGetRequest(url, authHeader, urlParams);
     }
 
-    private String generateAuthSignature(String baseString) throws NoSuchAlgorithmException {
-        String key = URLEncoder.encode(clientSecret, "UTF-8") + "&";
+    private static String generateNonce(int length) {
+        // Generate a random nonce
+        String characters = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+        StringBuilder nonce = new StringBuilder(length);
+        for (int i = 0; i < length; i++) {
+            nonce.append(characters.charAt(ThreadLocalRandom.current().nextInt(characters.length())));
+        }
+        return nonce.toString();
+    }
+
+    private static Map<String, String> splitUrl(String url) {
+        // Split the URL into base URL and parameters
+        Map<String, String> urlParams = new HashMap<>();
+        try {
+            String[] parts = url.split("\\?");
+            if (parts.length > 1) {
+                String queryString = parts[1];
+                String[] pairs = queryString.split("&");
+                for (String pair : pairs) {
+                    String[] keyValue = pair.split("=");
+                    urlParams.put(URLDecoder.decode(keyValue[0], "UTF-8"), URLDecoder.decode(keyValue[1], "UTF-8"));
+                }
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+        return urlParams;
+    }
+
+    private static String buildBaseString(String baseUrl, String method, Map<String, String> params) {
+        // Generate the base string for OAuth signature generation
+        String encodedParams = params.entrySet().stream()
+                .sorted(Map.Entry.comparingByKey())
+                .map(e -> String.format("%s=%s", e.getKey(), URLEncoder.encode(e.getValue(), "UTF-8")))
+                .collect(Collectors.joining("&"));
+        return String.format("%s&%s&%s", method, URLEncoder.encode(baseUrl, "UTF-8"), URLEncoder.encode(encodedParams, "UTF-8"));
+    }
+
+    private static String generateAuthSignature(String baseString, String compositeKey) throws NoSuchAlgorithmException, InvalidKeyException {
+        // Generate the OAuth signature
         Mac mac = Mac.getInstance("HmacSHA256");
-        mac.init(new SecretKeySpec(key.getBytes(), "HmacSHA256"));
-        byte[] signatureBytes = mac.doFinal(baseString.getBytes());
-        return Base64.getEncoder().encodeToString(signatureBytes);
+        SecretKeySpec keySpec = new SecretKeySpec(compositeKey.getBytes(), "HmacSHA256");
+        mac.init(keySpec);
+        byte[] rawHmac = mac.doFinal(baseString.getBytes());
+        return Base64.getEncoder().encodeToString(rawHmac);
     }
 
-    private Map<String, String> parseHeaders(HttpHeaders headers) {
-        return headers.map().entrySet().stream()
-            .collect(Collectors.toMap(
-                Map.Entry::getKey,
-                e -> e.getValue().get(0)
-            ));
+    private static String buildAuthHeader(Map<String, String> oauthParams) {
+        // Generate the OAuth authorization header
+        return "OAuth " + oauthParams.entrySet().stream()
+                .map(e -> String.format("%s=\"%s\"", e.getKey(), URLEncoder.encode(e.getValue(), "UTF-8")))
+                .collect(Collectors.joining(", "));
     }
 
-    private int countData(String jsonData) {
-        // Implement JSON parsing and counting logic here
-        return 0;
+    private Map<String, Object> makeGetRequest(String url, String authHeader, Map<String, String> params) throws IOException {
+        // Make a GET request to the API
+        HttpURLConnection connection = (HttpURLConnection) new URL(url).openConnection();
+        connection.setRequestProperty("Authorization", authHeader);
+        connection.setRequestProperty("Content-Type", "application/json");
+        connection.setRequestMethod("GET");
+
+        Map<String, Object> result = new HashMap<>();
+        int statusCode = connection.getResponseCode();
+        result.put("status_code", statusCode);
+        if (statusCode == 200) {
+            InputStream responseStream = connection.getInputStream();
+            Scanner s = new Scanner(responseStream).useDelimiter("\\A");
+            String response = s.hasNext() ? s.next() : "";
+            result.put("response", response);
+            result.put("headers", connection.getHeaderFields());
+        } else {
+            result.put("response", "Error occurred");
+        }
+        return result;
     }
 
     public static void main(String[] args) {
         try {
             OneRoster roster = new OneRoster();
-            roster.fetchAllData();
-        } catch (IOException | InterruptedException e) {
+            Map<String, List<Map<String, Object>>> data = roster.pullCompleteDataSet();
+            System.out.println(data);
+        } catch (Exception e) {
             e.printStackTrace();
         }
     }
