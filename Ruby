@@ -1,85 +1,189 @@
+require 'dotenv/load'
 require 'net/http'
 require 'uri'
 require 'openssl'
 require 'base64'
 require 'json'
-require 'dotenv/load'  # Make sure to include the dotenv gem in your Gemfile or install it
+require 'cgi'
 
 class OneRoster
-  attr_accessor :client_id, :client_secret, :base_url, :collections
+  # Base URL for the OneRoster API
+  # Endpoints to pull data from
+  ENDPOINTS = [
+    "/academicSessions",
+    "/orgs",
+    "/courses",
+    "/classes",
+    "/users",
+    "/enrollments",
+    "/demographics"
+  ].freeze
+
+  # Page size for API requests
+  PAGE_SIZE = 10_000
 
   def initialize
+    # Initialize the OneRoster client with client ID and secret from environment variables
     @client_id = ENV['CLIENT_ID']
     @client_secret = ENV['CLIENT_SECRET']
+    # Base URL for all API requests
     @base_url = ENV['BASE_URL']
-    @collections = ['academicSessions', 'orgs', 'courses', 'classes', 'users', 'enrollments', 'demographics']
   end
 
-  def fetch_all_data
-    @collections.each do |collection|
-      url = "#{@base_url}/#{collection}"
-      fetch_collection(url)
+  def make_roster_request(endpoint, limit = PAGE_SIZE, offset = 0)
+    # Construct the URL with pagination parameters
+    url = "#{@base_url}#{endpoint}?limit=#{limit}&offset=#{offset}"
+    # Generate timestamp and nonce for OAuth
+    timestamp = Time.now.to_i.to_s
+    nonce = generate_nonce(timestamp.length)
+
+    # OAuth parameters
+    oauth_params = {
+      'oauth_consumer_key' => @client_id,
+      'oauth_signature_method' => 'HMAC-SHA256',
+      'oauth_timestamp' => timestamp,
+      'oauth_nonce' => nonce
+    }
+
+    # Split URL into base URL and parameters
+    base_url, url_params = split_url(url)
+    # Merge OAuth parameters with URL parameters
+    all_params = oauth_params.merge(url_params)
+
+    # Create the base string for the OAuth signature
+    base_string = build_base_string(base_url, 'GET', all_params)
+    # Create the composite key for HMAC
+    composite_key = CGI.escape(@client_secret) + "&"
+    # Generate the OAuth signature
+    auth_signature = generate_auth_signature(base_string, composite_key)
+    oauth_params["oauth_signature"] = auth_signature
+
+    # Build the OAuth authorization header
+    auth_header = build_auth_header(oauth_params)
+
+    # Make the GET request to the API
+    make_get_request(base_url, auth_header, url_params)
+  end
+
+  def pull_complete_data_set
+    # Pull the complete data set from all defined endpoints
+    all_data = {}
+    # Loop through each endpoint to pull all data
+    ENDPOINTS.each do |endpoint|
+      all_data[endpoint] = pull_all_data(endpoint)
     end
+    all_data
   end
 
-  def fetch_collection(url)
-    limit = 10000
+  private
+
+  def pull_all_data(endpoint)
+    # Pull all data from a specified endpoint using pagination
+    data = []
     offset = 0
     total_count = nil
-    running_total = 0
 
-    while total_count.nil? || running_total < total_count
-      response = make_roster_request(url, limit, offset)
-      if response.code != '200'
-        puts "Error: #{response.code}"
-        handle_rate_limits(response.code)
-        next
+    until data.length == total_count
+      # Make the API request with retries
+      response = make_request_with_retries(endpoint, offset)
+      if response[:status_code] != 200
+        code = response[:status_code]
+        puts "Error in request to endpoint #{endpoint} - #{code}"
       end
-      data = JSON.parse(response.body)
-      count = data.size
-      running_total += count
-      total_count = response['x-total-count'].to_i
-      offset += limit
+
+      # Get the current page of data
+      response_name = endpoint.delete_prefix("/")
+      current_data = response[:response][response_name]
+      data.concat(current_data)
+
+      # Set total_count on the first request
+      total_count ||= response[:headers]['x-total-count'].to_i
+
+      # Update the offset for the next page
+      offset += PAGE_SIZE
     end
+
+    data
   end
 
-  def make_roster_request(url, limit, offset)
-    uri = URI("#{url}?limit=#{limit}&offset=#{offset}")
-    request = Net::HTTP::Get.new(uri)
-    request['Authorization'] = build_auth_header
+  def make_request_with_retries(endpoint, limit = PAGE_SIZE, offset = 0)
+    # Make a request with retries in case of rate limiting or server errors
+    retries = 0
+    max_retries = 3
+    base_wait_time = 1
 
-    Net::HTTP.start(uri.hostname, uri.port, use_ssl: uri.scheme == 'https') do |http|
-      http.request(request)
+    while retries < max_retries
+      response = make_roster_request(endpoint, limit, offset)
+      if response[:status_code] == 200
+        return response
+      elsif [429, 502].include?(response[:status_code])
+        # Apply exponential backoff with jitter
+        wait_time = base_wait_time * (2**retries) + rand / 1000.0
+        sleep(wait_time)
+        retries += 1
+      else
+        return response
+      end
     end
-  end
 
-  def handle_rate_limits(code)
-    sleep(60) if code == '429' || code == '502'  # Simple backoff strategy
-  end
-
-  def build_auth_header
-    method = 'GET'
-    timestamp = Time.now.to_i.to_s
-    nonce = generate_nonce(10)
-    signature = generate_auth_signature(method, timestamp, nonce)
-
-    "OAuth oauth_signature=\"#{signature}\""
+    { status_code: response[:status_code], response: "Max retries exceeded" }
   end
 
   def generate_nonce(length)
-    rand(36**length).to_s(36)
+    # Generate a random nonce
+    characters = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+    (0...length).map { characters[rand(characters.length)] }.join
   end
 
-  def generate_auth_signature(method, timestamp, nonce)
-    base_string = "#{method}&#{@base_url}&oauth_consumer_key=#{@client_id}&oauth_nonce=#{nonce}&oauth_signature_method=HMAC-SHA256&oauth_timestamp=#{timestamp}"
-    key = "#{@client_secret}&"
-    
-    digest = OpenSSL::Digest.new('sha256')
-    hmac = OpenSSL::HMAC.digest(digest, key, base_string)
-    Base64.strict_encode64(hmac)
+  def split_url(url)
+    # Split the URL into base URL and parameters
+    uri = URI.parse(url)
+    base_url = "#{uri.scheme}://#{uri.host}#{uri.path}"
+    url_params = URI.decode_www_form(uri.query || "").to_h
+    [base_url, url_params]
+  end
+
+  def build_base_string(base_url, method, params)
+    # Generate the base string for OAuth signature generation
+    encoded_params = params.sort.map { |k, v| "#{k}=#{CGI.escape(v.to_s)}" }.join('&')
+    "#{method}&#{CGI.escape(base_url)}&#{CGI.escape(encoded_params)}"
+  end
+
+  def generate_auth_signature(base_string, composite_key)
+    # Generate the OAuth signature
+    digest = OpenSSL::HMAC.digest(OpenSSL::Digest.new('sha256'), composite_key, base_string)
+    Base64.strict_encode64(digest)
+  end
+
+  def build_auth_header(oauth_params)
+    # Generate the OAuth authorization header
+    header_params = oauth_params.map { |k, v| "#{k}=\"#{CGI.escape(v)}\"" }.join(', ')
+    "OAuth #{header_params}"
+  end
+
+  def make_get_request(base_url, auth_header, params)
+    # Make a GET request to the API
+    uri = URI.parse(base_url)
+    uri.query = URI.encode_www_form(params)
+    request = Net::HTTP::Get.new(uri)
+    request['Authorization'] = auth_header
+
+    response = Net::HTTP.start(uri.hostname, uri.port, use_ssl: uri.scheme == 'https') do |http|
+      http.request(request)
+    end
+
+    {
+      status_code: response.code.to_i,
+      response: JSON.parse(response.body),
+      headers: response.each_header.to_h
+    }
+  rescue StandardError => e
+    { status_code: 0, response: "An error occurred: #{e.message}" }
   end
 end
 
-# Usage example:
-roster = OneRoster.new
-roster.fetch_all_data
+if __FILE__ == $0
+  roster = OneRoster.new
+  data = roster.pull_complete_data_set
+  puts data
+end
