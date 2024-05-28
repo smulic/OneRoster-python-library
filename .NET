@@ -1,114 +1,212 @@
 using System;
 using System.Collections.Generic;
 using System.Net.Http;
+using System.Security.Cryptography;
 using System.Text;
 using System.Threading.Tasks;
-using System.Security.Cryptography;
-using Microsoft.Extensions.Configuration; // Make sure to include Microsoft.Extensions.Configuration and Configuration.Json packages
+using System.Web;
+using System.Linq;
+using Newtonsoft.Json.Linq;
+using System.Threading;
+using Microsoft.Extensions.Configuration;
 
-public class OneRoster
+namespace OneRosterAPI
 {
-    private readonly string clientId;
-    private readonly string clientSecret;
-    private readonly string baseUrl;
-    private readonly string[] collections = { "academicSessions", "orgs", "courses", "classes", "users", "enrollments", "demographics" };
-    private readonly HttpClient httpClient = new HttpClient();
-
-    public OneRoster(IConfiguration configuration)
+    public class OneRoster
     {
-        clientId = configuration["CLIENT_ID"];
-        clientSecret = configuration["CLIENT_SECRET"];
-        baseUrl = configuration["BASE_URL"]
-    }
+        // Base URL for the OneRoster API
+        private readonly string baseUrl;
+        // Client ID and Secret for OAuth
+        private readonly string clientId;
+        private readonly string clientSecret;
 
-    public async Task FetchAllDataAsync()
-    {
-        foreach (var collection in collections)
+        // Endpoints to pull data from
+        private static readonly string[] ENDPOINTS = {
+            "/academicSessions",
+            "/orgs",
+            "/courses",
+            "/classes",
+            "/users",
+            "/enrollments",
+            "/demographics"
+        };
+
+        // Page size for API requests
+        private const int PAGE_SIZE = 10000;
+
+        public OneRoster(IConfiguration configuration)
         {
-            string url = $"{baseUrl}/{collection}";
-            await FetchCollectionAsync(url);
+            // Load the configuration settings
+            clientId = configuration["CLIENT_ID"];
+            clientSecret = configuration["CLIENT_SECRET"];
+            baseUrl = configuration["BASE_URL"];
         }
-    }
 
-    private async Task FetchCollectionAsync(string url)
-    {
-        int limit = 10000;
-        int offset = 0;
-        int totalCount = -1;
-        int runningTotal = 0;
-
-        while (totalCount == -1 || runningTotal < totalCount)
+        public async Task<Dictionary<string, List<JObject>>> PullCompleteDataSetAsync()
         {
-            var response = await MakeRosterRequestAsync(url, limit, offset);
-            if (!response.IsSuccessStatusCode)
+            var allData = new Dictionary<string, List<JObject>>();
+            // Loop through each endpoint to pull all data
+            foreach (var endpoint in ENDPOINTS)
             {
-                Console.WriteLine($"Error: {response.StatusCode}");
-                continue;
+                allData[endpoint] = await PullAllDataAsync(endpoint);
+            }
+            return allData;
+        }
+
+        private async Task<List<JObject>> PullAllDataAsync(string endpoint)
+        {
+            var data = new List<JObject>();
+            int offset = 0;
+            int? totalCount = null;
+
+            while (data.Count != totalCount)
+            {
+                var response = await MakeRequestWithRetriesAsync(endpoint, offset: offset);
+                if (response.StatusCode != 200)
+                {
+                    Console.WriteLine($"Error in request to endpoint {endpoint} - {response.StatusCode}");
+                    break;
+                }
+
+                var responseData = JObject.Parse(response.Response)["items"].ToObject<List<JObject>>();
+                data.AddRange(responseData);
+
+                if (totalCount == null)
+                {
+                    totalCount = int.Parse(response.Headers["x-total-count"]);
+                }
+
+                offset += PAGE_SIZE;
             }
 
-            var content = await response.Content.ReadAsStringAsync();
-            var count = CountData(content); // Assume CountData is implemented to parse and count the data
-            runningTotal += count;
-            totalCount = int.Parse(response.Headers.GetValues("x-total-count").ToString());
-            offset += limit;
+            return data;
         }
-    }
 
-    private async Task<HttpResponseMessage> MakeRosterRequestAsync(string url, int limit, int offset)
-    {
-        var requestUrl = $"{url}?limit={limit}&offset={offset}";
-        var request = new HttpRequestMessage(HttpMethod.Get, requestUrl);
-        request.Headers.Add("Authorization", BuildAuthHeader());
-        return await httpClient.SendAsync(request);
-    }
-
-    private string BuildAuthHeader()
-    {
-        string method = "GET";
-        string timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds().ToString();
-        string nonce = GenerateNonce(10);
-        string signature = GenerateAuthSignature(method, timestamp, nonce);
-        return $"OAuth oauth_signature=\"{Uri.EscapeDataString(signature)}\"";
-    }
-
-    private string GenerateNonce(int length)
-    {
-        const string chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-        var random = new Random();
-        var nonce = new char[length];
-        for (int i = 0; i < nonce.Length; i++)
+        private async Task<(int StatusCode, string Response, Dictionary<string, string> Headers)> MakeRequestWithRetriesAsync(string endpoint, int limit = PAGE_SIZE, int offset = 0)
         {
-            nonce[i] = chars[random.Next(chars.Length)];
+            int retries = 0;
+            const int maxRetries = 3;
+            const int baseWaitTime = 1;
+
+            while (retries < maxRetries)
+            {
+                var response = await MakeRosterRequestAsync(endpoint, limit, offset);
+                if (response.StatusCode == 200)
+                {
+                    return response;
+                }
+                else if (response.StatusCode == 429 || response.StatusCode == 502)
+                {
+                    var waitTime = baseWaitTime * Math.Pow(2, retries) + new Random().NextDouble();
+                    Thread.Sleep(TimeSpan.FromSeconds(waitTime));
+                    retries++;
+                }
+                else
+                {
+                    return response;
+                }
+            }
+
+            return (0, "Max retries exceeded", null);
         }
-        return new string(nonce);
-    }
 
-    private string GenerateAuthSignature(string method, string timestamp, string nonce)
-    {
-        var baseString = $"{method}&{Uri.EscapeDataString(baseUrl)}&oauth_consumer_key={clientId}&oauth_nonce={nonce}&oauth_signature_method=HMAC-SHA256&oauth_timestamp={timestamp}";
-        using var hmac = new HMACSHA256(Encoding.UTF8.GetBytes($"{clientSecret}&"));
-        var hash = hmac.ComputeHash(Encoding.UTF8.GetBytes(baseString));
-        return Convert.ToBase64String(hash);
-    }
+        private async Task<(int StatusCode, string Response, Dictionary<string, string> Headers)> MakeRosterRequestAsync(string endpoint, int limit, int offset)
+        {
+            using (var client = new HttpClient())
+            {
+                var url = $"{baseUrl}{endpoint}?limit={limit}&offset={offset}";
 
-    // Implement your data counting logic here
-    private int CountData(string jsonData)
-    {
-        // Dummy implementation: Parse JSON and count elements
-        return 10;
-    }
-}
+                // Generate timestamp and nonce for OAuth
+                var timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds().ToString();
+                var nonce = GenerateNonce(timestamp.Length);
 
-// In your Program.cs or Startup.cs:
-public class Program
-{
-    public static async Task Main(string[] args)
-    {
-        IConfiguration config = new ConfigurationBuilder()
-            .AddJsonFile("appsettings.json")
-            .Build();
+                // OAuth parameters
+                var oauthParams = new Dictionary<string, string>
+                {
+                    { "oauth_consumer_key", clientId },
+                    { "oauth_signature_method", "HMAC-SHA256" },
+                    { "oauth_timestamp", timestamp },
+                    { "oauth_nonce", nonce }
+                };
 
-        var oneRoster = new OneRoster(config);
-        await oneRoster.FetchAllDataAsync();
+                var (baseUrl, urlParams) = SplitUrl(url);
+                var allParams = oauthParams.Concat(urlParams).ToDictionary(kvp => kvp.Key, kvp => kvp.Value);
+
+                // Create the base string for the OAuth signature
+                var baseString = BuildBaseString(baseUrl, "GET", allParams);
+                // Create the composite key for HMAC
+                var compositeKey = HttpUtility.UrlEncode(clientSecret) + "&";
+                // Generate the OAuth signature
+                var authSignature = GenerateAuthSignature(baseString, compositeKey);
+                oauthParams["oauth_signature"] = authSignature;
+
+                // Build the OAuth authorization header
+                var authHeader = BuildAuthHeader(oauthParams);
+
+                // Make the GET request to the API
+                var request = new HttpRequestMessage(HttpMethod.Get, baseUrl);
+                request.Headers.Add("Authorization", authHeader);
+                foreach (var param in urlParams)
+                {
+                    request.Headers.Add(param.Key, param.Value);
+                }
+
+                var response = await client.SendAsync(request);
+                var responseContent = await response.Content.ReadAsStringAsync();
+
+                var headers = response.Headers.ToDictionary(h => h.Key, h => string.Join(",", h.Value));
+                return ((int)response.StatusCode, responseContent, headers);
+            }
+        }
+
+        private static string GenerateNonce(int length)
+        {
+            const string chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+            var random = new Random();
+            return new string(Enumerable.Repeat(chars, length).Select(s => s[random.Next(s.Length)]).ToArray());
+        }
+
+        private static (string BaseUrl, Dictionary<string, string> UrlParams) SplitUrl(string url)
+        {
+            var uri = new Uri(url);
+            var baseUrl = $"{uri.Scheme}://{uri.Host}{uri.AbsolutePath}";
+            var queryParams = HttpUtility.ParseQueryString(uri.Query);
+            var urlParams = queryParams.AllKeys.ToDictionary(k => k, k => queryParams[k]);
+            return (baseUrl, urlParams);
+        }
+
+        private static string BuildBaseString(string baseUrl, string method, Dictionary<string, string> params)
+        {
+            var encodedParams = string.Join("&", params.OrderBy(kvp => kvp.Key).Select(kvp => $"{kvp.Key}={HttpUtility.UrlEncode(kvp.Value)}"));
+            return $"{method}&{HttpUtility.UrlEncode(baseUrl)}&{HttpUtility.UrlEncode(encodedParams)}";
+        }
+
+        private static string GenerateAuthSignature(string baseString, string compositeKey)
+        {
+            using (var hasher = new HMACSHA256(Encoding.ASCII.GetBytes(compositeKey)))
+            {
+                var hash = hasher.ComputeHash(Encoding.ASCII.GetBytes(baseString));
+                return Convert.ToBase64String(hash);
+            }
+        }
+
+        private static string BuildAuthHeader(Dictionary<string, string> oauthParams)
+        {
+            var headerParams = string.Join(", ", oauthParams.Select(kvp => $"{kvp.Key}=\"{HttpUtility.UrlEncode(kvp.Value)}\""));
+            return $"OAuth {headerParams}";
+        }
+
+        static async Task Main(string[] args)
+        {
+            var builder = new ConfigurationBuilder()
+                .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
+                .AddEnvironmentVariables();
+
+            IConfiguration configuration = builder.Build();
+
+            var roster = new OneRoster(configuration);
+            var data = await roster.PullCompleteDataSetAsync();
+            Console.WriteLine(data);
+        }
     }
 }
