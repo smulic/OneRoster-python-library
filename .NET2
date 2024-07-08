@@ -14,21 +14,29 @@ namespace ClassLink.OneRoster
     {
         private readonly string _clientId;
         private readonly string _clientSecret;
+        private readonly string baseUrl;
         private const int PageSize = 10000;
         private const int MaxRetries = 5;
 
-        public OneRoster(string clientId, string clientSecret)
+        public OneRoster(IConfiguration configuration)
         {
-            _clientId = clientId ?? throw new ArgumentNullException(nameof(clientId));
-            _clientSecret = clientSecret ?? throw new ArgumentNullException(nameof(clientSecret));
+            // Load the configuration settings
+            clientId = configuration["CLIENT_ID"];
+            clientSecret = configuration["CLIENT_SECRET"];
+            baseUrl = configuration["BASE_URL"];
         }
 
-        public List<OneRosterResponse> GetAllData(string baseUrl)
+        public List<OneRosterResponse> GetAllData()
         {
             var endpoints = new List<string>
             {
-                "/academicSessions", "/orgs", "/courses", "/classes",
-                "/users", "/enrollments", "/demographics"
+                "/academicSessions", 
+                "/orgs", 
+                "/courses", 
+                "/classes",
+                "/users", 
+                "/enrollments", 
+                "/demographics"
             };
 
             var allData = new List<OneRosterResponse>();
@@ -208,6 +216,18 @@ namespace ClassLink.OneRoster
                 }
             }
             return result;
+        }
+
+        public static void Task Main(string[] args)
+        {
+            var builder = new ConfigurationBuilder()
+                .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
+                .AddEnvironmentVariables();
+
+            IConfiguration configuration = builder.Build();
+
+            var roster = new OneRoster(configuration);
+            var data = roster.GetAllData();
         }
     }
 
