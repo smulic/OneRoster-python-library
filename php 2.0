@@ -1,0 +1,266 @@
+<?php
+
+namespace App\OneRoster;
+
+use GuzzleHttp\Client;
+use GuzzleHttp\Exception\RequestException;
+
+class OneRoster
+{
+    private string $clientId;
+    private string $clientSecret;
+    private Client $httpClient;
+    private const PAGE_SIZE = 10000;
+    private const MAX_RETRIES = 5;
+
+    public function __construct(string $clientId, string $clientSecret)
+    {
+        $this->clientId = $clientId;
+        $this->clientSecret = $clientSecret;
+        $this->httpClient = new Client();
+    }
+
+    /**
+     * Fetches all data from specified collections using pagination.
+     * 
+     * @return array All data from the specified collections.
+     */
+    public function fetchAllData(): array
+    {
+        $collections = [
+            'academicSessions',
+            'orgs',
+            'courses',
+            'classes',
+            'users',
+            'enrollments',
+            'demographics'
+        ];
+
+        $allData = [];
+
+        // Fetch data for each collection.
+        foreach ($collections as $collection) {
+            $allData[$collection] = $this->fetchCollectionData($collection);
+        }
+
+        return $allData;
+    }
+
+    /**
+     * Fetches data for a specific collection using pagination.
+     * 
+     * @param string $collection The name of the collection.
+     * @return array Data from the collection.
+     */
+    private function fetchCollectionData(string $collection): array
+    {
+        $data = [];
+        $offset = 0;
+        $totalCount = 0;
+        $runningTotal = 0;
+
+        do {
+            $url = $this->buildUrl($collection, self::PAGE_SIZE, $offset);
+            $response = $this->makeRosterRequest($url);
+
+            if ($response['status_code'] === 200) {
+                $responseBody = json_decode($response['response'], true);
+                $data = array_merge($data, $responseBody['data']);
+                $totalCount = $responseBody['total'] ?? count($responseBody['data']);
+                $runningTotal += count($responseBody['data']);
+                $offset += self::PAGE_SIZE;
+            } else {
+                // Handle error responses with retries.
+                $this->handleErrorResponse($response, $url);
+            }
+        } while ($runningTotal < $totalCount && !empty($responseBody['data']));
+
+        return $data;
+    }
+
+    /**
+     * Builds the URL with query parameters for pagination.
+     * 
+     * @param string $endpoint The API endpoint.
+     * @param int $limit The limit of records per request.
+     * @param int $offset The offset for pagination.
+     * @return string The complete URL.
+     */
+    private function buildUrl(string $endpoint, int $limit, int $offset): string
+    {
+        return sprintf('%s?limit=%d&offset=%d', $endpoint, $limit, $offset);
+    }
+
+    /**
+     * Makes a request to the OneRoster API with OAuth 1.0a authentication.
+     * 
+     * @param string $url The complete URL for the request.
+     * @return array The status code and response from the API.
+     */
+    public function makeRosterRequest(string $url): array
+    {
+        $timestamp = strval(time());
+        $nonce = $this->generateNonce(strlen($timestamp));
+
+        // OAuth parameters.
+        $oauth = [
+            'oauth_consumer_key' => $this->clientId,
+            'oauth_signature_method' => 'HMAC-SHA256',
+            'oauth_timestamp' => $timestamp,
+            'oauth_nonce' => $nonce,
+        ];
+
+        // Split URL into base and query parameters.
+        [$baseUrl, $queryParams] = $this->splitUrl($url);
+        $params = array_merge($oauth, $queryParams);
+
+        // Build the base string for OAuth signature.
+        $baseInfo = $this->buildBaseString($baseUrl, 'GET', $params);
+        $compositeKey = rawurlencode($this->clientSecret) . '&';
+        $oauthSignature = base64_encode(hash_hmac('SHA256', $baseInfo, $compositeKey, true));
+        $oauth['oauth_signature'] = $oauthSignature;
+
+        // Create the authorization header.
+        $authHeader = $this->buildAuthorizationHeader($oauth);
+
+        // Make the HTTP request.
+        return $this->makeHttpRequest($authHeader, $url);
+    }
+
+    /**
+     * Builds the base string for OAuth signature generation.
+     * 
+     * @param string $baseURI The base URL.
+     * @param string $method The HTTP method (e.g., GET).
+     * @param array $params The query parameters.
+     * @return string The base string.
+     */
+    private function buildBaseString(string $baseURI, string $method, array $params): string
+    {
+        ksort($params);
+        $paramString = implode('&', array_map(
+            fn($key, $value) => sprintf('%s=%s', $key, rawurlencode($value)),
+            array_keys($params),
+            $params
+        ));
+
+        return sprintf('%s&%s&%s', $method, rawurlencode($baseURI), rawurlencode($paramString));
+    }
+
+    /**
+     * Generates a nonce for OAuth.
+     * 
+     * @param int $length The length of the nonce.
+     * @return string The generated nonce.
+     */
+    private function generateNonce(int $length): string
+    {
+        return bin2hex(random_bytes($length / 2));
+    }
+
+    /**
+     * Builds the authorization header for OAuth.
+     * 
+     * @param array $oauth The OAuth parameters.
+     * @return string The authorization header.
+     */
+    private function buildAuthorizationHeader(array $oauth): string
+    {
+        $header = 'Authorization: OAuth ';
+        $values = array_map(
+            fn($key, $value) => sprintf('%s="%s"', $key, rawurlencode($value)),
+            array_keys($oauth),
+            $oauth
+        );
+
+        return $header . implode(',', $values);
+    }
+
+    /**
+     * Splits the URL into base and query parameters.
+     * 
+     * @param string $url The complete URL.
+     * @return array The base URL and query parameters.
+     */
+    private function splitUrl(string $url): array
+    {
+        $urlParts = parse_url($url);
+        $baseUrl = sprintf('%s://%s%s', $urlParts['scheme'], $urlParts['host'], $urlParts['path']);
+        parse_str($urlParts['query'] ?? '', $queryParams);
+
+        return [$baseUrl, $queryParams];
+    }
+
+    /**
+     * Makes the HTTP request using Guzzle and handles retries for specific errors.
+     * 
+     * @param string $authHeader The authorization header.
+     * @param string $url The complete URL for the request.
+     * @return array The status code and response from the API.
+     */
+    private function makeHttpRequest(string $authHeader, string $url): array
+    {
+        $retryCount = 0;
+
+        do {
+            try {
+                $response = $this->httpClient->request('GET', $url, [
+                    'headers' => ['Authorization' => $authHeader],
+                ]);
+
+                return [
+                    'status_code' => $response->getStatusCode(),
+                    'response' => $response->getBody()->getContents(),
+                ];
+            } catch (RequestException $e) {
+                $statusCode = $e->getResponse()->getStatusCode();
+
+                if ($statusCode === 429 || $statusCode === 502) {
+                    // Exponential backoff with jitter.
+                    $retryCount++;
+                    $waitTime = (1 << $retryCount) + mt_rand(0, 1000) / 1000;
+                    sleep($waitTime);
+                } else {
+                    return [
+                        'status_code' => $statusCode,
+                        'response' => $e->getMessage(),
+                    ];
+                }
+            }
+        } while ($retryCount <= self::MAX_RETRIES);
+
+        return [
+            'status_code' => 500,
+            'response' => 'Max retries exceeded',
+        ];
+    }
+
+    /**
+     * Handles error responses and retries the request with exponential backoff and jitter.
+     * 
+     * @param array $response The response from the API.
+     * @param string $url The complete URL for the request.
+     */
+    private function handleErrorResponse(array $response, string $url): void
+    {
+        $retryCount = 0;
+
+        while ($retryCount < self::MAX_RETRIES) {
+            $waitTime = (1 << $retryCount) + mt_rand(0, 1000) / 1000;
+            sleep($waitTime);
+
+            $response = $this->makeRosterRequest($url);
+
+            if ($response['status_code'] === 200) {
+                break;
+            }
+
+            $retryCount++;
+        }
+
+        if ($retryCount >= self::MAX_RETRIES) {
+            throw new \RuntimeException('Max retries exceeded for URL: ' . $url);
+        }
+    }
+}
