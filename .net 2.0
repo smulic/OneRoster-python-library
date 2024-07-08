@@ -23,8 +23,14 @@ namespace ClassLink.OneRoster
             _clientSecret = clientSecret ?? throw new ArgumentNullException(nameof(clientSecret));
         }
 
+        /// <summary>
+        /// Retrieves all data from the specified base URL by iterating through each collection
+        /// </summary>
+        /// <param name="baseUrl">The base URL of the OneRoster API</param>
+        /// <returns>A list of OneRosterResponse objects containing the data</returns>
         public List<OneRosterResponse> GetAllData(string baseUrl)
         {
+            // List of endpoints to retrieve data from
             var endpoints = new List<string>
             {
                 "/academicSessions", "/orgs", "/courses", "/classes",
@@ -40,6 +46,7 @@ namespace ClassLink.OneRoster
                 int runningTotal = 0;
                 int offset = 0;
 
+                // Loop to pull data in pages
                 do
                 {
                     var response = MakeRosterRequest(url);
@@ -58,11 +65,18 @@ namespace ClassLink.OneRoster
             return allData;
         }
 
+        /// <summary>
+        /// Makes a roster request to the given URL with the stored key and secret
+        /// </summary>
+        /// <param name="url">The URL for the request, with params included</param>
+        /// <returns>A OneRosterResponse object containing the status code and response</returns>
         public OneRosterResponse MakeRosterRequest(string url)
         {
+            // Generate timestamp and nonce for OAuth
             var timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds().ToString();
             var nonce = GenerateNonce(8);
             
+            // Define OAuth parameters
             var oauth = new Dictionary<string, string>
             {
                 {"oauth_consumer_key", _clientId},
@@ -71,20 +85,28 @@ namespace ClassLink.OneRoster
                 {"oauth_nonce", nonce}
             };
 
+            // Combine URL parameters and OAuth parameters into a sorted dictionary
             var urlPieces = url.Split('?');
             var allParams = urlPieces.Length == 2
                 ? SortAllParams(ParamsToDic(urlPieces[1]), oauth)
                 : SortAllParams(new Dictionary<string, string>(), oauth);
 
+            // Generate the OAuth signature
             var baseInfo = BuildBaseString(urlPieces[0], "GET", allParams);
             var compositeKey = UrlEncodeUpperCase(_clientSecret) + "&";
             var authSignature = GenerateSig(baseInfo, compositeKey);
             oauth.Add("oauth_signature", authSignature);
             
+            // Generate the authorization header and make the request
             var authHeader = BuildAuthHeader(oauth);
             return MakeGetRequest(authHeader, url);
         }
 
+        /// <summary>
+        /// Generates a random string for the nonce
+        /// </summary>
+        /// <param name="len">The length of the nonce</param>
+        /// <returns>A random string for the nonce</returns>
         private static string GenerateNonce(int len)
         {
             const string allowedChars = "ABCDEFGHJKLMNOPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz0123456789";
@@ -99,6 +121,14 @@ namespace ClassLink.OneRoster
             return new string(chars);
         }
 
+        /// <summary>
+        /// Makes the GET request to the given URL with the generated authorization header
+        /// Implements exponential backoff with jitter for error handling
+        /// </summary>
+        /// <param name="authHeader">The generated auth header</param>
+        /// <param name="url">The URL for the request</param>
+        /// <param name="retryCount">The current retry count for exponential backoff</param>
+        /// <returns>A OneRosterResponse object containing the status code and response</returns>
         private OneRosterResponse MakeGetRequest(string authHeader, string url, int retryCount = 0)
         {
             try
@@ -127,6 +157,7 @@ namespace ClassLink.OneRoster
                 var statusCode = (int)errorResponse.StatusCode;
                 if (statusCode == 429 || statusCode == 502)
                 {
+                    // Handle 429 and 502 errors with exponential backoff and jitter
                     if (retryCount < MaxRetries)
                     {
                         int waitTime = (int)(Math.Pow(2, retryCount) + new Random().NextDouble());
@@ -145,6 +176,11 @@ namespace ClassLink.OneRoster
             return null;
         }
 
+        /// <summary>
+        /// Generates the authorization header from the OAuth parameters
+        /// </summary>
+        /// <param name="oauth">A dictionary of OAuth parameters</param>
+        /// <returns>The authorization header</returns>
         private static string BuildAuthHeader(Dictionary<string, string> oauth)
         {
             var headerValues = new List<string>();
@@ -155,6 +191,12 @@ namespace ClassLink.OneRoster
             return "OAuth " + string.Join(",", headerValues);
         }
 
+        /// <summary>
+        /// Generates the OAuth signature from the base string and key
+        /// </summary>
+        /// <param name="baseString">The base string generated from method, URL, and parameters</param>
+        /// <param name="key">The key created from ClientSecret</param>
+        /// <returns>The generated OAuth signature</returns>
         private static string GenerateSig(string baseString, string key)
         {
             using var sha256 = new HMACSHA256(Encoding.ASCII.GetBytes(key));
@@ -162,6 +204,13 @@ namespace ClassLink.OneRoster
             return Convert.ToBase64String(hashBytes);
         }
 
+        /// <summary>
+        /// Builds the base string for the generation of the OAuth signature
+        /// </summary>
+        /// <param name="baseUrl">The base URL without parameters</param>
+        /// <param name="method">The request's HTTP method</param>
+        /// <param name="allParams">The URL parameters and OAuth parameters</param>
+        /// <returns>The base string</returns>
         private static string BuildBaseString(string baseUrl, string method, SortedDictionary<string, string> allParams)
         {
             var paramList = new List<string>();
@@ -173,6 +222,11 @@ namespace ClassLink.OneRoster
             return $"{method}&{UrlEncodeUpperCase(baseUrl)}&{UrlEncodeUpperCase(string.Join("&", paramList))}";
         }
 
+        /// <summary>
+        /// URL encodes the string and converts to uppercase
+        /// </summary>
+        /// <param name="value">The string to encode</param>
+        /// <returns>The encoded string</returns>
         private static string UrlEncodeUpperCase(string value)
         {
             var encoded = HttpUtility.UrlEncode(value) ?? string.Empty;
@@ -180,6 +234,12 @@ namespace ClassLink.OneRoster
             return Regex.Replace(encoded, "(%[0-9a-f][0-9a-f])", c => c.Value.ToUpper());
         }
 
+        /// <summary>
+        /// Combines all the parameters into one sorted dictionary
+        /// </summary>
+        /// <param name="urlParams">The parameters from the URL</param>
+        /// <param name="oauth">The OAuth parameters</param>
+        /// <returns>A sorted dictionary of all the parameters</returns>
         private static SortedDictionary<string, string> SortAllParams(Dictionary<string, string> urlParams, Dictionary<string, string> oauth)
         {
             var result = new SortedDictionary<string, string>(urlParams);
@@ -190,6 +250,11 @@ namespace ClassLink.OneRoster
             return result;
         }
 
+        /// <summary>
+        /// Converts the parameters from the URL to a dictionary
+        /// </summary>
+        /// <param name="urlPiece">The parameters in the URL</param>
+        /// <returns>A dictionary of the parameters</returns>
         private static Dictionary<string, string> ParamsToDic(string urlPiece)
         {
             var result = new Dictionary<string, string>();
