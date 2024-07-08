@@ -1,0 +1,227 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Net;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Threading;
+using System.Web;
+
+namespace ClassLink.OneRoster
+{
+    public class OneRoster
+    {
+        private readonly string _clientId;
+        private readonly string _clientSecret;
+        private const int PageSize = 10000;
+        private const int MaxRetries = 5;
+
+        public OneRoster(string clientId, string clientSecret)
+        {
+            _clientId = clientId ?? throw new ArgumentNullException(nameof(clientId));
+            _clientSecret = clientSecret ?? throw new ArgumentNullException(nameof(clientSecret));
+        }
+
+        public List<OneRosterResponse> GetAllData(string baseUrl)
+        {
+            var endpoints = new List<string>
+            {
+                "/academicSessions", "/orgs", "/courses", "/classes",
+                "/users", "/enrollments", "/demographics"
+            };
+
+            var allData = new List<OneRosterResponse>();
+
+            foreach (var endpoint in endpoints)
+            {
+                var url = $"{baseUrl}{endpoint}?limit={PageSize}&offset=0";
+                int totalCount = 0;
+                int runningTotal = 0;
+                int offset = 0;
+
+                do
+                {
+                    var response = MakeRosterRequest(url);
+                    if (response == null || string.IsNullOrEmpty(response.Response)) break;
+
+                    totalCount = int.Parse(response.Headers["x-total-count"]);
+                    runningTotal += int.Parse(response.Headers["x-count"]);
+                    allData.Add(response);
+
+                    offset += PageSize;
+                    url = $"{baseUrl}{endpoint}?limit={PageSize}&offset={offset}";
+
+                } while (runningTotal < totalCount);
+            }
+
+            return allData;
+        }
+
+        public OneRosterResponse MakeRosterRequest(string url)
+        {
+            var timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds().ToString();
+            var nonce = GenerateNonce(8);
+            
+            var oauth = new Dictionary<string, string>
+            {
+                {"oauth_consumer_key", _clientId},
+                {"oauth_signature_method", "HMAC-SHA256"},
+                {"oauth_timestamp", timestamp},
+                {"oauth_nonce", nonce}
+            };
+
+            var urlPieces = url.Split('?');
+            var allParams = urlPieces.Length == 2
+                ? SortAllParams(ParamsToDic(urlPieces[1]), oauth)
+                : SortAllParams(new Dictionary<string, string>(), oauth);
+
+            var baseInfo = BuildBaseString(urlPieces[0], "GET", allParams);
+            var compositeKey = UrlEncodeUpperCase(_clientSecret) + "&";
+            var authSignature = GenerateSig(baseInfo, compositeKey);
+            oauth.Add("oauth_signature", authSignature);
+            
+            var authHeader = BuildAuthHeader(oauth);
+            return MakeGetRequest(authHeader, url);
+        }
+
+        private static string GenerateNonce(int len)
+        {
+            const string allowedChars = "ABCDEFGHJKLMNOPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz0123456789";
+            var chars = new char[len];
+            var rd = new Random();
+            
+            for (int i = 0; i < len; i++)
+            {
+                chars[i] = allowedChars[rd.Next(allowedChars.Length)];
+            }
+
+            return new string(chars);
+        }
+
+        private OneRosterResponse MakeGetRequest(string authHeader, string url, int retryCount = 0)
+        {
+            try
+            {
+                var webRequest = WebRequest.CreateHttp(url);
+                if (webRequest != null)
+                {
+                    webRequest.Method = "GET";
+                    webRequest.Timeout = 25000;
+                    webRequest.Headers.Add("Authorization", authHeader);
+
+                    using var webResponse = (HttpWebResponse)webRequest.GetResponse();
+                    using var stream = webResponse.GetResponseStream();
+                    using var reader = new StreamReader(stream);
+                    var response = reader.ReadToEnd();
+                    var headers = new WebHeaderCollection
+                    {
+                        {"x-total-count", webResponse.Headers["x-total-count"]},
+                        {"x-count", webResponse.Headers["x-count"]}
+                    };
+                    return new OneRosterResponse((int)webResponse.StatusCode, response, headers);
+                }
+            }
+            catch (WebException webException) when (webException.Response is HttpWebResponse errorResponse)
+            {
+                var statusCode = (int)errorResponse.StatusCode;
+                if (statusCode == 429 || statusCode == 502)
+                {
+                    if (retryCount < MaxRetries)
+                    {
+                        int waitTime = (int)(Math.Pow(2, retryCount) + new Random().NextDouble());
+                        Thread.Sleep(waitTime * 1000);
+                        return MakeGetRequest(authHeader, url, retryCount + 1);
+                    }
+                }
+                using var reader = new StreamReader(errorResponse.GetResponseStream() ?? Stream.Null);
+                return new OneRosterResponse(statusCode, reader.ReadToEnd());
+            }
+            catch (Exception)
+            {
+                return new OneRosterResponse(0, "An error occurred, check your URL");
+            }
+
+            return null;
+        }
+
+        private static string BuildAuthHeader(Dictionary<string, string> oauth)
+        {
+            var headerValues = new List<string>();
+            foreach (var kvp in oauth)
+            {
+                headerValues.Add($"{kvp.Key}=\"{UrlEncodeUpperCase(kvp.Value)}\"");
+            }
+            return "OAuth " + string.Join(",", headerValues);
+        }
+
+        private static string GenerateSig(string baseString, string key)
+        {
+            using var sha256 = new HMACSHA256(Encoding.ASCII.GetBytes(key));
+            var hashBytes = sha256.ComputeHash(Encoding.ASCII.GetBytes(baseString));
+            return Convert.ToBase64String(hashBytes);
+        }
+
+        private static string BuildBaseString(string baseUrl, string method, SortedDictionary<string, string> allParams)
+        {
+            var paramList = new List<string>();
+            foreach (var kvp in allParams)
+            {
+                paramList.Add($"{kvp.Key}={UrlEncodeUpperCase(kvp.Value)}");
+            }
+
+            return $"{method}&{UrlEncodeUpperCase(baseUrl)}&{UrlEncodeUpperCase(string.Join("&", paramList))}";
+        }
+
+        private static string UrlEncodeUpperCase(string value)
+        {
+            var encoded = HttpUtility.UrlEncode(value) ?? string.Empty;
+            encoded = encoded.Replace("+", "%20");
+            return Regex.Replace(encoded, "(%[0-9a-f][0-9a-f])", c => c.Value.ToUpper());
+        }
+
+        private static SortedDictionary<string, string> SortAllParams(Dictionary<string, string> urlParams, Dictionary<string, string> oauth)
+        {
+            var result = new SortedDictionary<string, string>(urlParams);
+            foreach (var kvp in oauth)
+            {
+                result[kvp.Key] = kvp.Value;
+            }
+            return result;
+        }
+
+        private static Dictionary<string, string> ParamsToDic(string urlPiece)
+        {
+            var result = new Dictionary<string, string>();
+            var theParams = urlPiece.Split('&');
+            foreach (var value in theParams)
+            {
+                var decodedVal = HttpUtility.UrlDecode(value);
+                var split = decodedVal?.Split('=');
+                if (split?.Length == 2)
+                {
+                    result[split[0]] = split[1];
+                }
+                else if (split != null)
+                {
+                    result["filter"] = decodedVal.Substring(7);
+                }
+            }
+            return result;
+        }
+    }
+
+    public class OneRosterResponse
+    {
+        public int StatusCode { get; }
+        public string Response { get; }
+        public WebHeaderCollection Headers { get; }
+
+        public OneRosterResponse(int statusCode, string response, WebHeaderCollection headers = null)
+        {
+            StatusCode = statusCode;
+            Response = response ?? throw new ArgumentNullException(nameof(response));
+            Headers = headers ?? new WebHeaderCollection();
+        }
+    }
+}
